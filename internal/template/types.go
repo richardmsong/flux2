@@ -1,0 +1,120 @@
+/*
+Copyright 2024 The Flux authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package template
+
+import (
+	"context"
+
+	"helm.sh/helm/v3/pkg/chart"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	helmv2 "github.com/fluxcd/helm-controller/api/v2"
+	sourcev1 "github.com/fluxcd/source-controller/api/v1"
+)
+
+// HelmTemplateOptions contains options for templating a HelmRelease
+type HelmTemplateOptions struct {
+	// HelmRelease is the HelmRelease resource to template
+	HelmRelease *helmv2.HelmRelease
+
+	// HelmRepositories are HelmRepository resources referenced by the HelmRelease
+	HelmRepositories map[string]*sourcev1.HelmRepository
+
+	// ValuesFiles are additional values files to merge
+	ValuesFiles []string
+
+	// SetValues are individual value overrides (key=value format)
+	SetValues map[string]string
+
+	// ChartPath is the path to a local chart directory (overrides fetching)
+	ChartPath string
+
+	// KubeVersion is the Kubernetes version to use for rendering
+	KubeVersion string
+
+	// APIVersions are the available API versions for Capabilities
+	APIVersions []string
+
+	// Namespace is the target namespace for rendering
+	Namespace string
+
+	// ReleaseName is the name to use for the Helm release
+	ReleaseName string
+
+	// DryRun skips Secret/ConfigMap value resolution from cluster
+	DryRun bool
+
+	// KubeClient is the Kubernetes client for fetching Secrets/ConfigMaps
+	KubeClient client.Client
+}
+
+// ChartFetcher fetches Helm charts from various sources
+type ChartFetcher interface {
+	// Fetch fetches a chart from the given source
+	Fetch(ctx context.Context, opts *FetchOptions) (*chart.Chart, error)
+}
+
+// FetchOptions contains options for fetching a chart
+type FetchOptions struct {
+	// ChartName is the name of the chart to fetch
+	ChartName string
+
+	// ChartVersion is the version of the chart to fetch
+	ChartVersion string
+
+	// Repository is the HelmRepository to fetch from
+	Repository *sourcev1.HelmRepository
+
+	// LocalPath is the path to a local chart (if set, overrides remote fetching)
+	LocalPath string
+
+	// RegistryCredentials contains credentials for OCI registries
+	RegistryCredentials *RegistryCredentials
+
+	// KubeClient is used to fetch credentials from Secrets
+	KubeClient client.Client
+
+	// Namespace is the namespace to look for Secrets
+	Namespace string
+}
+
+// RegistryCredentials contains credentials for accessing OCI registries
+type RegistryCredentials struct {
+	// Username for basic auth
+	Username string
+
+	// Password for basic auth
+	Password string
+
+	// CAFile is the path to a CA certificate file
+	CAFile string
+
+	// CertFile is the path to a client certificate file
+	CertFile string
+
+	// KeyFile is the path to a client key file
+	KeyFile string
+
+	// Insecure allows insecure connections
+	Insecure bool
+}
+
+// PostRenderer applies post-rendering transformations to rendered manifests
+type PostRenderer interface {
+	// Run applies post-rendering to the given manifests
+	Run(renderedManifests []byte) ([]byte, error)
+}
