@@ -107,6 +107,9 @@ func (m *ValuesMerger) getValuesFromReference(vf helmv2.ValuesReference, namespa
 	}
 
 	if !found {
+		if vf.Optional {
+			return make(map[string]interface{}), nil
+		}
 		return nil, fmt.Errorf("valuesFrom references %s %q which was not found in the provided manifest files; "+
 			"include the %s in your manifest or use --values flag to provide values directly",
 			vf.Kind, vf.Name, vf.Kind)
