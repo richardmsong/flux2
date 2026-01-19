@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -69,12 +70,16 @@ will be cloned to a temporary directory and used as the source path.`,
   flux template -f ./manifest.yaml
 
   # Template multiple resources from a single multi-document YAML file
-  flux template -f ./multi-doc.yaml`,
+  flux template -f ./multi-doc.yaml
+
+  # Template from stdin (pipe from other commands)
+  kustomize build ./overlay | flux template -f -
+  cat manifest.yaml | flux template -f -`,
 	RunE: templateCmdRun,
 }
 
 func init() {
-	templateCmd.Flags().StringVarP(&templateArgs.file, "file", "f", "", "path to the Flux resource manifest file (auto-detects HelmRelease or Kustomization)")
+	templateCmd.Flags().StringVarP(&templateArgs.file, "file", "f", "", "path to the Flux resource manifest file (auto-detects HelmRelease or Kustomization); use '-' to read from stdin")
 
 	rootCmd.AddCommand(templateCmd)
 }
@@ -194,14 +199,40 @@ func templateCmdRun(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("--file/-f is required")
 	}
 
+	// Handle stdin: write to temp file so it can be read multiple times
+	filePath := templateArgs.file
+	if templateArgs.file == "-" {
+		data, err := io.ReadAll(os.Stdin)
+		if err != nil {
+			return fmt.Errorf("failed to read from stdin: %w", err)
+		}
+
+		tmpFile, err := os.CreateTemp("", "flux-template-stdin-*.yaml")
+		if err != nil {
+			return fmt.Errorf("failed to create temp file for stdin: %w", err)
+		}
+		defer os.Remove(tmpFile.Name())
+
+		if _, err := tmpFile.Write(data); err != nil {
+			tmpFile.Close()
+			return fmt.Errorf("failed to write stdin to temp file: %w", err)
+		}
+		tmpFile.Close()
+
+		filePath = tmpFile.Name()
+	}
+
 	// Parse all resources from the main file
-	resources, err := parseAllResources(templateArgs.file)
+	resources, err := parseAllResources(filePath)
 	if err != nil {
 		return fmt.Errorf("failed to parse resources: %w", err)
 	}
 
 	// Check if we have any resources to render
 	if len(resources.helmReleases) == 0 && len(resources.kustomizations) == 0 {
+		if templateArgs.file == "-" {
+			return fmt.Errorf("no supported Flux resource (HelmRelease or Kustomization) found in stdin")
+		}
 		return fmt.Errorf("no supported Flux resource (HelmRelease or Kustomization) found in file %s", templateArgs.file)
 	}
 
@@ -218,7 +249,7 @@ func templateCmdRun(cmd *cobra.Command, args []string) error {
 
 	// Render all Kustomizations
 	if len(resources.kustomizations) > 0 {
-		rendered, err := renderKustomizations(cmd, resources.kustomizations, resources.sources)
+		rendered, err := renderKustomizations(cmd, resources.kustomizations, resources.sources, filePath)
 		if err != nil {
 			return err
 		}
@@ -257,7 +288,7 @@ func renderHelmReleases(cmd *cobra.Command, helmReleases []*helmv2.HelmRelease, 
 }
 
 // renderKustomizations renders all Kustomization resources
-func renderKustomizations(cmd *cobra.Command, kustomizations []*kustomizev1.Kustomization, sources map[string]*unstructured.Unstructured) ([]byte, error) {
+func renderKustomizations(cmd *cobra.Command, kustomizations []*kustomizev1.Kustomization, sources map[string]*unstructured.Unstructured, manifestFile string) ([]byte, error) {
 	var output bytes.Buffer
 
 	// Track cloned git repos for cleanup
@@ -269,7 +300,7 @@ func renderKustomizations(cmd *cobra.Command, kustomizations []*kustomizev1.Kust
 	}()
 
 	for _, ks := range kustomizations {
-		rendered, err := renderSingleKustomization(cmd, ks, sources, clonedRepos)
+		rendered, err := renderSingleKustomization(cmd, ks, sources, clonedRepos, manifestFile)
 		if err != nil {
 			return nil, err
 		}
@@ -280,7 +311,7 @@ func renderKustomizations(cmd *cobra.Command, kustomizations []*kustomizev1.Kust
 }
 
 // renderSingleKustomization renders a single Kustomization resource
-func renderSingleKustomization(cmd *cobra.Command, ks *kustomizev1.Kustomization, sources map[string]*unstructured.Unstructured, clonedRepos map[string]string) ([]byte, error) {
+func renderSingleKustomization(cmd *cobra.Command, ks *kustomizev1.Kustomization, sources map[string]*unstructured.Unstructured, clonedRepos map[string]string, manifestFile string) ([]byte, error) {
 	name := ks.Name
 
 	// Determine the path based on the source
@@ -321,7 +352,8 @@ func renderSingleKustomization(cmd *cobra.Command, ks *kustomizev1.Kustomization
 	} else if ks.Spec.Path != "" {
 		path = ks.Spec.Path
 	} else {
-		path = filepath.Dir(templateArgs.file)
+		// Use manifest file's directory, or current working directory when reading from stdin
+		path = filepath.Dir(manifestFile)
 	}
 
 	// Normalize the path
@@ -339,7 +371,7 @@ func renderSingleKustomization(cmd *cobra.Command, ks *kustomizev1.Kustomization
 	// Build in dry-run mode (never connects to cluster)
 	builder, err := build.NewBuilder(name, path,
 		build.WithTimeout(rootArgs.timeout),
-		build.WithKustomizationFile(templateArgs.file),
+		build.WithKustomizationFile(manifestFile),
 		build.WithDryRun(true),
 		build.WithNamespace(*kubeconfigArgs.Namespace),
 	)
