@@ -28,12 +28,14 @@ import (
 
 	"github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/plumbing"
+	"github.com/google/go-containerregistry/pkg/crane"
 	"github.com/spf13/cobra"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	k8syaml "k8s.io/apimachinery/pkg/util/yaml"
 
 	helmv2 "github.com/fluxcd/helm-controller/api/v2"
 	kustomizev1 "github.com/fluxcd/kustomize-controller/api/v1"
+	"github.com/fluxcd/pkg/oci"
 	ssautil "github.com/fluxcd/pkg/ssa/utils"
 	sourcev1 "github.com/fluxcd/source-controller/api/v1"
 
@@ -316,8 +318,12 @@ func renderSingleKustomization(cmd *cobra.Command, ks *kustomizev1.Kustomization
 
 	// Determine the path based on the source
 	var path string
-	if ks.Spec.SourceRef.Kind == sourcev1.GitRepositoryKind {
-		// Look up the GitRepository from generic sources
+	sourceKind := ks.Spec.SourceRef.Kind
+
+	// Handle supported source types
+	switch sourceKind {
+	case sourcev1.GitRepositoryKind, sourcev1.OCIRepositoryKind, sourcev1.BucketKind:
+		// Look up the source from generic sources
 		namespace := ks.Spec.SourceRef.Namespace
 		if namespace == "" {
 			namespace = ks.Namespace
@@ -326,34 +332,53 @@ func renderSingleKustomization(cmd *cobra.Command, ks *kustomizev1.Kustomization
 			}
 		}
 
-		sourceKey := fmt.Sprintf("%s/%s/%s", sourcev1.GitRepositoryKind, namespace, ks.Spec.SourceRef.Name)
+		sourceKey := fmt.Sprintf("%s/%s/%s", sourceKind, namespace, ks.Spec.SourceRef.Name)
 		source, found := sources[sourceKey]
 		if !found {
-			sourceKey = fmt.Sprintf("%s/%s", sourcev1.GitRepositoryKind, ks.Spec.SourceRef.Name)
+			sourceKey = fmt.Sprintf("%s/%s", sourceKind, ks.Spec.SourceRef.Name)
 			source, found = sources[sourceKey]
 		}
 
-		if found {
-			// Clone the git repository if not already cloned
-			repoPath, err := cloneGitRepositoryFromUnstructured(source, clonedRepos)
+		if !found {
+			return nil, fmt.Errorf("%s %s not found in manifest; include the %s resource in the manifest file", sourceKind, ks.Spec.SourceRef.Name, sourceKind)
+		}
+
+		// Fetch the source content based on its kind
+		var sourcePath string
+		var err error
+
+		switch sourceKind {
+		case sourcev1.GitRepositoryKind:
+			sourcePath, err = cloneGitRepositoryFromUnstructured(source, clonedRepos)
 			if err != nil {
 				return nil, fmt.Errorf("failed to clone GitRepository %s: %w", ks.Spec.SourceRef.Name, err)
 			}
 
-			// Use the spec.path relative to the cloned repo
-			if ks.Spec.Path != "" {
-				path = filepath.Join(repoPath, ks.Spec.Path)
-			} else {
-				path = repoPath
+		case sourcev1.OCIRepositoryKind:
+			sourcePath, err = pullOCIRepositoryFromUnstructured(source, clonedRepos)
+			if err != nil {
+				return nil, fmt.Errorf("failed to pull OCIRepository %s: %w", ks.Spec.SourceRef.Name, err)
 			}
-		} else {
-			return nil, fmt.Errorf("GitRepository %s not found in manifest; include the GitRepository resource in the manifest file", ks.Spec.SourceRef.Name)
+
+		case sourcev1.BucketKind:
+			return nil, fmt.Errorf("Bucket source type is not supported for local templating; Bucket sources require cloud provider credentials which are typically managed by the cluster")
 		}
-	} else if ks.Spec.Path != "" {
-		path = ks.Spec.Path
-	} else {
-		// Use manifest file's directory, or current working directory when reading from stdin
-		path = filepath.Dir(manifestFile)
+
+		// Use the spec.path relative to the fetched source
+		if ks.Spec.Path != "" {
+			path = filepath.Join(sourcePath, ks.Spec.Path)
+		} else {
+			path = sourcePath
+		}
+
+	default:
+		// For unknown or no source type, use local path
+		if ks.Spec.Path != "" {
+			path = ks.Spec.Path
+		} else {
+			// Use manifest file's directory, or current working directory when reading from stdin
+			path = filepath.Dir(manifestFile)
+		}
 	}
 
 	// Normalize the path
@@ -485,6 +510,79 @@ func cloneGitRepositoryFromUnstructured(u *unstructured.Unstructured, clonedRepo
 			os.RemoveAll(tmpDir)
 			return "", fmt.Errorf("failed to checkout commit %s: %w", commitRef, err)
 		}
+	}
+
+	clonedRepos[repoKey] = tmpDir
+	return tmpDir, nil
+}
+
+// pullOCIRepositoryFromUnstructured pulls an OCIRepository artifact to a temporary directory
+func pullOCIRepositoryFromUnstructured(u *unstructured.Unstructured, clonedRepos map[string]string) (string, error) {
+	namespace := u.GetNamespace()
+	name := u.GetName()
+
+	// Check if already pulled
+	repoKey := fmt.Sprintf("oci/%s/%s", namespace, name)
+	if dir, exists := clonedRepos[repoKey]; exists {
+		return dir, nil
+	}
+
+	// Extract spec.url
+	spec, found, err := unstructured.NestedMap(u.Object, "spec")
+	if err != nil || !found {
+		return "", fmt.Errorf("failed to get spec from OCIRepository")
+	}
+
+	ociURL, found, err := unstructured.NestedString(spec, "url")
+	if err != nil || !found {
+		return "", fmt.Errorf("failed to get spec.url from OCIRepository")
+	}
+
+	// Parse the OCI URL
+	url, err := oci.ParseArtifactURL(ociURL)
+	if err != nil {
+		return "", fmt.Errorf("failed to parse OCI URL %s: %w", ociURL, err)
+	}
+
+	// Extract reference settings (tag, digest, semver)
+	ref, refFound, _ := unstructured.NestedMap(spec, "ref")
+	if refFound {
+		if tag, ok, _ := unstructured.NestedString(ref, "tag"); ok && tag != "" {
+			url = fmt.Sprintf("%s:%s", url, tag)
+		} else if digest, ok, _ := unstructured.NestedString(ref, "digest"); ok && digest != "" {
+			url = fmt.Sprintf("%s@%s", url, digest)
+		} else if semver, ok, _ := unstructured.NestedString(ref, "semver"); ok && semver != "" {
+			// For semver constraints, we need to resolve the latest matching version
+			// This is a simplified approach - we use the constraint as-is and let the registry resolve it
+			url = fmt.Sprintf("%s:%s", url, semver)
+		}
+	}
+
+	// Create temp directory
+	tmpDir, err := os.MkdirTemp("", fmt.Sprintf("flux-template-oci-%s-", name))
+	if err != nil {
+		return "", fmt.Errorf("failed to create temp directory: %w", err)
+	}
+
+	// Configure OCI client options
+	opts := oci.DefaultOptions()
+
+	// Check for insecure flag
+	insecure, _, _ := unstructured.NestedBool(spec, "insecure")
+	if insecure {
+		opts = append(opts, crane.Insecure)
+	}
+
+	ociClient := oci.NewClient(opts)
+
+	// Pull the artifact
+	ctx, cancel := context.WithTimeout(context.Background(), rootArgs.timeout)
+	defer cancel()
+
+	_, err = ociClient.Pull(ctx, url, tmpDir)
+	if err != nil {
+		os.RemoveAll(tmpDir)
+		return "", fmt.Errorf("failed to pull OCI artifact %s: %w", url, err)
 	}
 
 	clonedRepos[repoKey] = tmpDir
