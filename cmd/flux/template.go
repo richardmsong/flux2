@@ -182,6 +182,19 @@ func parseAllResources(path string) (*parsedResources, error) {
 			// Store with multiple keys for flexible lookup
 			result.sources[fmt.Sprintf("%s/%s/%s", kind, namespace, name)] = &u
 			result.sources[fmt.Sprintf("%s/%s", kind, name)] = &u
+
+		case isCoreResource(apiVersion, kind):
+			// Store core resources (ConfigMap, Secret) for valuesFrom references
+			var u unstructured.Unstructured
+			u.SetUnstructuredContent(raw)
+			namespace := u.GetNamespace()
+			if namespace == "" {
+				namespace = "default"
+			}
+			name := u.GetName()
+			// Store with multiple keys for flexible lookup
+			result.sources[fmt.Sprintf("%s/%s/%s", kind, namespace, name)] = &u
+			result.sources[fmt.Sprintf("%s/%s", kind, name)] = &u
 		}
 	}
 
@@ -203,6 +216,14 @@ func isKustomizationAPIVersion(apiVersion string) bool {
 
 func isSourceAPIVersion(apiVersion string) bool {
 	return strings.HasPrefix(apiVersion, "source.toolkit.fluxcd.io/")
+}
+
+func isCoreResource(apiVersion, kind string) bool {
+	// Match ConfigMap and Secret from core API
+	if apiVersion == "v1" && (kind == "ConfigMap" || kind == "Secret") {
+		return true
+	}
+	return false
 }
 
 func templateCmdRun(cmd *cobra.Command, args []string) error {

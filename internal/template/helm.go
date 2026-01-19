@@ -88,8 +88,8 @@ func (r *HelmRenderer) Render(ctx context.Context, opts *HelmTemplateOptions) ([
 		return nil, fmt.Errorf("failed to fetch chart: %w", err)
 	}
 
-	// Merge values
-	values, err := r.valuesMerger.MergeValues(ctx, opts.HelmRelease, opts.ValuesFiles, opts.SetValues)
+	// Merge values (pass Sources which may contain ConfigMaps/Secrets for valuesFrom)
+	values, err := r.valuesMerger.MergeValues(ctx, opts.HelmRelease, opts.Sources, opts.ValuesFiles, opts.SetValues)
 	if err != nil {
 		return nil, fmt.Errorf("failed to merge values: %w", err)
 	}

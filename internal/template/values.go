@@ -18,12 +18,14 @@ package template
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"os"
 	"strconv"
 	"strings"
 
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"sigs.k8s.io/yaml"
 
 	helmv2 "github.com/fluxcd/helm-controller/api/v2"
@@ -37,10 +39,10 @@ func NewValuesMerger() *ValuesMerger {
 	return &ValuesMerger{}
 }
 
-// MergeValues merges values from HelmRelease spec, values files, and set values
-// Note: valuesFrom references (ConfigMaps/Secrets) are not supported as this never connects to the cluster.
-// Use --values flag to provide values files instead.
-func (m *ValuesMerger) MergeValues(ctx context.Context, hr *helmv2.HelmRelease, valuesFiles []string, setValues map[string]string) (map[string]interface{}, error) {
+// MergeValues merges values from HelmRelease spec, valuesFrom references, values files, and set values.
+// Resources map should contain any ConfigMaps or Secrets referenced in valuesFrom, keyed by "Kind/namespace/name".
+// If a valuesFrom reference is not found in resources, an error is returned.
+func (m *ValuesMerger) MergeValues(ctx context.Context, hr *helmv2.HelmRelease, resources map[string]*unstructured.Unstructured, valuesFiles []string, setValues map[string]string) (map[string]interface{}, error) {
 	result := make(map[string]interface{})
 
 	// 1. Get values from HelmRelease spec (inline values)
@@ -52,10 +54,23 @@ func (m *ValuesMerger) MergeValues(ctx context.Context, hr *helmv2.HelmRelease, 
 		result = mergeMaps(result, inlineValues)
 	}
 
-	// Note: valuesFrom references (ConfigMaps/Secrets) are skipped as we never connect to the cluster.
-	// Users should provide these values via --values flag instead.
+	// 2. Process valuesFrom references (ConfigMaps/Secrets from manifest)
+	if len(hr.Spec.ValuesFrom) > 0 {
+		namespace := hr.Namespace
+		if namespace == "" {
+			namespace = "default"
+		}
 
-	// 2. Merge additional values files
+		for _, vf := range hr.Spec.ValuesFrom {
+			valuesFromData, err := m.getValuesFromReference(vf, namespace, resources)
+			if err != nil {
+				return nil, err
+			}
+			result = mergeMaps(result, valuesFromData)
+		}
+	}
+
+	// 3. Merge additional values files
 	for _, file := range valuesFiles {
 		fileValues, err := loadValuesFile(file)
 		if err != nil {
@@ -64,7 +79,7 @@ func (m *ValuesMerger) MergeValues(ctx context.Context, hr *helmv2.HelmRelease, 
 		result = mergeMaps(result, fileValues)
 	}
 
-	// 3. Apply --set values
+	// 4. Apply --set values
 	for key, value := range setValues {
 		if err := setNestedValue(result, key, value); err != nil {
 			return nil, fmt.Errorf("failed to set value %s=%s: %w", key, value, err)
@@ -72,6 +87,119 @@ func (m *ValuesMerger) MergeValues(ctx context.Context, hr *helmv2.HelmRelease, 
 	}
 
 	return result, nil
+}
+
+// getValuesFromReference retrieves values from a ConfigMap or Secret reference
+func (m *ValuesMerger) getValuesFromReference(vf helmv2.ValuesReference, namespace string, resources map[string]*unstructured.Unstructured) (map[string]interface{}, error) {
+	// Determine the namespace for the reference
+	refNamespace := namespace
+	if vf.TargetPath != "" {
+		// TargetPath is handled after getting the values
+	}
+
+	// Build the resource key
+	resourceKey := fmt.Sprintf("%s/%s/%s", vf.Kind, refNamespace, vf.Name)
+	resource, found := resources[resourceKey]
+	if !found {
+		// Try without namespace
+		resourceKey = fmt.Sprintf("%s/%s", vf.Kind, vf.Name)
+		resource, found = resources[resourceKey]
+	}
+
+	if !found {
+		return nil, fmt.Errorf("valuesFrom references %s %q which was not found in the provided manifest files; "+
+			"include the %s in your manifest or use --values flag to provide values directly",
+			vf.Kind, vf.Name, vf.Kind)
+	}
+
+	// Get the data from the resource
+	var data map[string]string
+	var err error
+
+	switch vf.Kind {
+	case "ConfigMap":
+		data, _, err = unstructured.NestedStringMap(resource.Object, "data")
+		if err != nil {
+			return nil, fmt.Errorf("failed to get data from ConfigMap %q: %w", vf.Name, err)
+		}
+	case "Secret":
+		// Secrets have base64-encoded data
+		secretData, found, err := unstructured.NestedStringMap(resource.Object, "data")
+		if err != nil {
+			return nil, fmt.Errorf("failed to get data from Secret %q: %w", vf.Name, err)
+		}
+		if found {
+			data = make(map[string]string)
+			for k, v := range secretData {
+				decoded, err := base64.StdEncoding.DecodeString(v)
+				if err != nil {
+					return nil, fmt.Errorf("failed to decode Secret %q key %q: %w", vf.Name, k, err)
+				}
+				data[k] = string(decoded)
+			}
+		}
+	default:
+		return nil, fmt.Errorf("unsupported valuesFrom kind: %s (only ConfigMap and Secret are supported)", vf.Kind)
+	}
+
+	if data == nil {
+		return make(map[string]interface{}), nil
+	}
+
+	// Determine the key to use
+	valuesKey := vf.ValuesKey
+	if valuesKey == "" {
+		valuesKey = "values.yaml"
+	}
+
+	// Get the values content
+	valuesContent, found := data[valuesKey]
+	if !found {
+		if vf.Optional {
+			return make(map[string]interface{}), nil
+		}
+		return nil, fmt.Errorf("%s %q does not contain key %q", vf.Kind, vf.Name, valuesKey)
+	}
+
+	// Parse the values content as YAML
+	var values map[string]interface{}
+	if err := yaml.Unmarshal([]byte(valuesContent), &values); err != nil {
+		return nil, fmt.Errorf("failed to parse values from %s %q key %q: %w", vf.Kind, vf.Name, valuesKey, err)
+	}
+
+	// If targetPath is specified, nest the values under that path
+	if vf.TargetPath != "" {
+		nested := make(map[string]interface{})
+		if err := setNestedMap(nested, vf.TargetPath, values); err != nil {
+			return nil, fmt.Errorf("failed to set targetPath %q: %w", vf.TargetPath, err)
+		}
+		return nested, nil
+	}
+
+	return values, nil
+}
+
+// setNestedMap sets a nested map value using dot notation
+func setNestedMap(m map[string]interface{}, path string, value map[string]interface{}) error {
+	keys := strings.Split(path, ".")
+	current := m
+
+	for i, k := range keys {
+		if i == len(keys)-1 {
+			current[k] = value
+		} else {
+			if _, ok := current[k]; !ok {
+				current[k] = make(map[string]interface{})
+			}
+			if nested, ok := current[k].(map[string]interface{}); ok {
+				current = nested
+			} else {
+				return fmt.Errorf("key %s is not a map", strings.Join(keys[:i+1], "."))
+			}
+		}
+	}
+
+	return nil
 }
 
 // loadValuesFile loads values from a YAML file
