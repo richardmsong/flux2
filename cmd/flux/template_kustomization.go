@@ -43,7 +43,9 @@ would do, including:
 - Processing recursive Kustomizations (with --recursive flag)
 
 This command is similar to 'flux build kustomization' but is designed for templating
-workflows where you want to render manifests locally without applying them to a cluster.`,
+workflows where you want to render manifests locally without applying them to a cluster.
+
+Note: You can also use 'flux template -f <file>' which auto-detects the resource type.`,
 	Example: `  # Template a Kustomization using a local manifest file
   flux template kustomization my-app \
     --path ./manifests \

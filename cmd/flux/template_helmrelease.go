@@ -49,7 +49,9 @@ The command requires either:
 - A local chart path (--chart-path) with a HelmRelease file
 
 When using --dry-run mode, the command will not connect to the cluster and will skip
-resolving values from ConfigMaps and Secrets referenced in the HelmRelease.`,
+resolving values from ConfigMaps and Secrets referenced in the HelmRelease.
+
+Note: You can also use 'flux template -f <file>' which auto-detects the resource type.`,
 	Example: `  # Template a HelmRelease from a manifest file
   flux template helmrelease -f ./helmrelease.yaml --source-file ./helmrepository.yaml
 
@@ -76,16 +78,16 @@ resolving values from ConfigMaps and Secrets referenced in the HelmRelease.`,
 }
 
 type templateHelmReleaseFlags struct {
-	file         string
-	sourceFiles  []string
-	valuesFiles  []string
-	setValues    map[string]string
-	chartPath    string
-	kubeVersion  string
-	apiVersions  []string
-	namespace    string
-	releaseName  string
-	dryRun       bool
+	file        string
+	sourceFiles []string
+	valuesFiles []string
+	setValues   map[string]string
+	chartPath   string
+	kubeVersion string
+	apiVersions []string
+	namespace   string
+	releaseName string
+	dryRun      bool
 }
 
 var templateHelmReleaseArgs templateHelmReleaseFlags
