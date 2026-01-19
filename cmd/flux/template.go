@@ -200,18 +200,6 @@ func templateCmdRun(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to parse resources: %w", err)
 	}
 
-	// Parse additional source files
-	for _, f := range templateArgs.sourceFiles {
-		additionalResources, err := parseAllResources(f)
-		if err != nil {
-			return fmt.Errorf("failed to parse source file %s: %w", f, err)
-		}
-		// Merge all sources
-		for k, v := range additionalResources.sources {
-			resources.sources[k] = v
-		}
-	}
-
 	// Check if we have any resources to render
 	if len(resources.helmReleases) == 0 && len(resources.kustomizations) == 0 {
 		return fmt.Errorf("no supported Flux resource (HelmRelease or Kustomization) found in file %s", templateArgs.file)
@@ -470,4 +458,3 @@ func cloneGitRepositoryFromUnstructured(u *unstructured.Unstructured, clonedRepo
 	clonedRepos[repoKey] = tmpDir
 	return tmpDir, nil
 }
-

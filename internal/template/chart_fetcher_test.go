@@ -22,7 +22,7 @@ import (
 
 func TestIsVersionConstraint(t *testing.T) {
 	tests := []struct {
-		version    string
+		version      string
 		isConstraint bool
 	}{
 		// Exact versions - NOT constraints

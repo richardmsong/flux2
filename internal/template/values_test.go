@@ -393,7 +393,7 @@ func TestValuesMerger_MergeValues_SetValues(t *testing.T) {
 	}
 
 	setValues := map[string]string{
-		"image.tag":   "v2.0.0",
+		"image.tag":    "v2.0.0",
 		"replicaCount": "5",
 		"debug":        "true",
 	}
