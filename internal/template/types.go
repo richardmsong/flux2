@@ -20,10 +20,9 @@ import (
 	"context"
 
 	"helm.sh/helm/v3/pkg/chart"
-	"sigs.k8s.io/controller-runtime/pkg/client"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 
 	helmv2 "github.com/fluxcd/helm-controller/api/v2"
-	sourcev1 "github.com/fluxcd/source-controller/api/v1"
 )
 
 // HelmTemplateOptions contains options for templating a HelmRelease
@@ -31,8 +30,8 @@ type HelmTemplateOptions struct {
 	// HelmRelease is the HelmRelease resource to template
 	HelmRelease *helmv2.HelmRelease
 
-	// HelmRepositories are HelmRepository resources referenced by the HelmRelease
-	HelmRepositories map[string]*sourcev1.HelmRepository
+	// Sources are source resources (HelmRepository, GitRepository, etc.) keyed by "Kind/namespace/name" or "Kind/name"
+	Sources map[string]*unstructured.Unstructured
 
 	// ValuesFiles are additional values files to merge
 	ValuesFiles []string
@@ -54,12 +53,6 @@ type HelmTemplateOptions struct {
 
 	// ReleaseName is the name to use for the Helm release
 	ReleaseName string
-
-	// DryRun skips Secret/ConfigMap value resolution from cluster
-	DryRun bool
-
-	// KubeClient is the Kubernetes client for fetching Secrets/ConfigMaps
-	KubeClient client.Client
 }
 
 // ChartFetcher fetches Helm charts from various sources
@@ -76,20 +69,14 @@ type FetchOptions struct {
 	// ChartVersion is the version of the chart to fetch
 	ChartVersion string
 
-	// Repository is the HelmRepository to fetch from
-	Repository *sourcev1.HelmRepository
+	// Source is the source resource (HelmRepository, etc.) as an unstructured object
+	Source *unstructured.Unstructured
 
 	// LocalPath is the path to a local chart (if set, overrides remote fetching)
 	LocalPath string
 
-	// RegistryCredentials contains credentials for OCI registries
+	// RegistryCredentials contains credentials for OCI registries (provided directly, not fetched from cluster)
 	RegistryCredentials *RegistryCredentials
-
-	// KubeClient is used to fetch credentials from Secrets
-	KubeClient client.Client
-
-	// Namespace is the namespace to look for Secrets
-	Namespace string
 }
 
 // RegistryCredentials contains credentials for accessing OCI registries

@@ -28,8 +28,8 @@ import (
 	"github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/spf13/cobra"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	k8syaml "k8s.io/apimachinery/pkg/util/yaml"
-	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	helmv2 "github.com/fluxcd/helm-controller/api/v2"
 	kustomizev1 "github.com/fluxcd/kustomize-controller/api/v1"
@@ -38,7 +38,6 @@ import (
 
 	"github.com/fluxcd/flux2/v2/internal/build"
 	"github.com/fluxcd/flux2/v2/internal/template"
-	"github.com/fluxcd/flux2/v2/internal/utils"
 )
 
 type templateFlags struct {
@@ -51,7 +50,6 @@ type templateFlags struct {
 	apiVersions []string
 	namespace   string
 	releaseName string
-	dryRun      bool
 	// Kustomization-specific flags
 	path         string
 	ignorePaths  []string
@@ -72,6 +70,9 @@ or 'kustomize build' for Kustomize overlays.
 This command interprets Flux resources through source-controller, helm-controller, and
 kustomize-controller logic to render out the final manifests to stdout.
 
+The command never connects to the cluster. All resources (HelmRepository, GitRepository,
+ConfigMaps, Secrets for values) must be provided via manifest files.
+
 When using -f/--file, the command automatically detects the resource type from the
 manifest and renders it appropriately. If the file contains multiple HelmRelease or
 Kustomization resources, all of them will be rendered.
@@ -91,10 +92,7 @@ will be cloned to a temporary directory and used as the source path.`,
     --set image.tag=v1.0.0
 
   # Template a Kustomization with path
-  flux template -f ./kustomization.yaml --path ./manifests
-
-  # Template in dry-run mode (no cluster connection)
-  flux template -f ./manifest.yaml --dry-run`,
+  flux template -f ./kustomization.yaml --path ./manifests`,
 	RunE: templateCmdRun,
 }
 
@@ -108,7 +106,6 @@ func init() {
 	templateCmd.Flags().StringSliceVar(&templateArgs.apiVersions, "api-versions", nil, "available API versions for Capabilities (HelmRelease only)")
 	templateCmd.Flags().StringVar(&templateArgs.namespace, "template-namespace", "", "namespace to use for rendering (overrides resource spec)")
 	templateCmd.Flags().StringVar(&templateArgs.releaseName, "release-name", "", "release name to use for rendering (HelmRelease only)")
-	templateCmd.Flags().BoolVar(&templateArgs.dryRun, "dry-run", false, "dry-run mode (no cluster connection)")
 	// Kustomization-specific flags
 	templateCmd.Flags().StringVar(&templateArgs.path, "path", "", "path to the manifests location (Kustomization only)")
 	templateCmd.Flags().StringSliceVar(&templateArgs.ignorePaths, "ignore-paths", nil, "set paths to ignore in .gitignore format (Kustomization only)")
@@ -121,10 +118,11 @@ func init() {
 
 // parsedResources holds all parsed resources from the manifest files
 type parsedResources struct {
-	helmReleases     []*helmv2.HelmRelease
-	kustomizations   []*kustomizev1.Kustomization
-	helmRepositories map[string]*sourcev1.HelmRepository
-	gitRepositories  map[string]*sourcev1.GitRepository
+	helmReleases   []*helmv2.HelmRelease
+	kustomizations []*kustomizev1.Kustomization
+	// sources holds all source resources (HelmRepository, GitRepository, OCIRepository, Bucket, etc.)
+	// keyed by "Kind/namespace/name" and "Kind/name" for lookup
+	sources map[string]*unstructured.Unstructured
 }
 
 // parseAllResources parses all supported resources from a file
@@ -135,8 +133,7 @@ func parseAllResources(path string) (*parsedResources, error) {
 	}
 
 	result := &parsedResources{
-		helmRepositories: make(map[string]*sourcev1.HelmRepository),
-		gitRepositories:  make(map[string]*sourcev1.GitRepository),
+		sources: make(map[string]*unstructured.Unstructured),
 	}
 
 	// Split by YAML document separator
@@ -173,27 +170,18 @@ func parseAllResources(path string) (*parsedResources, error) {
 				result.kustomizations = append(result.kustomizations, &ks)
 			}
 
-		case kind == sourcev1.HelmRepositoryKind && isSourceAPIVersion(apiVersion):
-			var repo sourcev1.HelmRepository
-			if err := decoder.Decode(&repo); err == nil && repo.Kind == sourcev1.HelmRepositoryKind {
-				namespace := repo.Namespace
-				if namespace == "" {
-					namespace = "default"
-				}
-				result.helmRepositories[fmt.Sprintf("%s/%s", namespace, repo.Name)] = &repo
-				result.helmRepositories[repo.Name] = &repo
+		case isSourceAPIVersion(apiVersion):
+			// Store all source resources generically (HelmRepository, GitRepository, OCIRepository, Bucket, etc.)
+			var u unstructured.Unstructured
+			u.SetUnstructuredContent(raw)
+			namespace := u.GetNamespace()
+			if namespace == "" {
+				namespace = "default"
 			}
-
-		case kind == sourcev1.GitRepositoryKind && isSourceAPIVersion(apiVersion):
-			var repo sourcev1.GitRepository
-			if err := decoder.Decode(&repo); err == nil && repo.Kind == sourcev1.GitRepositoryKind {
-				namespace := repo.Namespace
-				if namespace == "" {
-					namespace = "default"
-				}
-				result.gitRepositories[fmt.Sprintf("%s/%s", namespace, repo.Name)] = &repo
-				result.gitRepositories[repo.Name] = &repo
-			}
+			name := u.GetName()
+			// Store with multiple keys for flexible lookup
+			result.sources[fmt.Sprintf("%s/%s/%s", kind, namespace, name)] = &u
+			result.sources[fmt.Sprintf("%s/%s", kind, name)] = &u
 		}
 	}
 
@@ -234,13 +222,9 @@ func templateCmdRun(cmd *cobra.Command, args []string) error {
 		if err != nil {
 			return fmt.Errorf("failed to parse source file %s: %w", f, err)
 		}
-		// Merge HelmRepositories
-		for k, v := range additionalResources.helmRepositories {
-			resources.helmRepositories[k] = v
-		}
-		// Merge GitRepositories
-		for k, v := range additionalResources.gitRepositories {
-			resources.gitRepositories[k] = v
+		// Merge all sources
+		for k, v := range additionalResources.sources {
+			resources.sources[k] = v
 		}
 	}
 
@@ -253,7 +237,7 @@ func templateCmdRun(cmd *cobra.Command, args []string) error {
 
 	// Render all HelmReleases
 	if len(resources.helmReleases) > 0 {
-		rendered, err := renderHelmReleases(cmd, resources.helmReleases, resources.helmRepositories)
+		rendered, err := renderHelmReleases(cmd, resources.helmReleases, resources.sources)
 		if err != nil {
 			return err
 		}
@@ -262,7 +246,7 @@ func templateCmdRun(cmd *cobra.Command, args []string) error {
 
 	// Render all Kustomizations
 	if len(resources.kustomizations) > 0 {
-		rendered, err := renderKustomizations(cmd, resources.kustomizations, resources.gitRepositories)
+		rendered, err := renderKustomizations(cmd, resources.kustomizations, resources.sources)
 		if err != nil {
 			return err
 		}
@@ -274,41 +258,26 @@ func templateCmdRun(cmd *cobra.Command, args []string) error {
 }
 
 // renderHelmReleases renders all HelmRelease resources
-func renderHelmReleases(cmd *cobra.Command, helmReleases []*helmv2.HelmRelease, helmRepositories map[string]*sourcev1.HelmRepository) ([]byte, error) {
+func renderHelmReleases(cmd *cobra.Command, helmReleases []*helmv2.HelmRelease, sources map[string]*unstructured.Unstructured) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), rootArgs.timeout)
 	defer cancel()
 
-	// Get Kubernetes client if not in dry-run mode
-	var kubeClient client.Client
-	var err error
-	if !templateArgs.dryRun {
-		kubeClient, err = utils.KubeClient(kubeconfigArgs, kubeclientOptions)
-		if err != nil {
-			if templateArgs.chartPath == "" {
-				logger.Warningf("failed to create Kubernetes client, continuing in dry-run mode: %v", err)
-			}
-			kubeClient = nil
-		}
-	}
-
-	// Create renderer
-	renderer := template.NewHelmRenderer(kubeClient, templateArgs.dryRun || kubeClient == nil)
+	// Create renderer (never connects to cluster)
+	renderer := template.NewHelmRenderer()
 
 	// Render each HelmRelease
 	var output bytes.Buffer
 	for _, hr := range helmReleases {
 		opts := &template.HelmTemplateOptions{
-			HelmRelease:      hr,
-			HelmRepositories: helmRepositories,
-			ValuesFiles:      templateArgs.valuesFiles,
-			SetValues:        templateArgs.setValues,
-			ChartPath:        templateArgs.chartPath,
-			KubeVersion:      templateArgs.kubeVersion,
-			APIVersions:      templateArgs.apiVersions,
-			Namespace:        templateArgs.namespace,
-			ReleaseName:      templateArgs.releaseName,
-			DryRun:           templateArgs.dryRun || kubeClient == nil,
-			KubeClient:       kubeClient,
+			HelmRelease: hr,
+			Sources:     sources,
+			ValuesFiles: templateArgs.valuesFiles,
+			SetValues:   templateArgs.setValues,
+			ChartPath:   templateArgs.chartPath,
+			KubeVersion: templateArgs.kubeVersion,
+			APIVersions: templateArgs.apiVersions,
+			Namespace:   templateArgs.namespace,
+			ReleaseName: templateArgs.releaseName,
 		}
 
 		rendered, err := renderer.Render(ctx, opts)
@@ -323,7 +292,7 @@ func renderHelmReleases(cmd *cobra.Command, helmReleases []*helmv2.HelmRelease, 
 }
 
 // renderKustomizations renders all Kustomization resources
-func renderKustomizations(cmd *cobra.Command, kustomizations []*kustomizev1.Kustomization, gitRepositories map[string]*sourcev1.GitRepository) ([]byte, error) {
+func renderKustomizations(cmd *cobra.Command, kustomizations []*kustomizev1.Kustomization, sources map[string]*unstructured.Unstructured) ([]byte, error) {
 	var output bytes.Buffer
 
 	// Track cloned git repos for cleanup
@@ -335,7 +304,7 @@ func renderKustomizations(cmd *cobra.Command, kustomizations []*kustomizev1.Kust
 	}()
 
 	for _, ks := range kustomizations {
-		rendered, err := renderSingleKustomization(cmd, ks, gitRepositories, clonedRepos)
+		rendered, err := renderSingleKustomization(cmd, ks, sources, clonedRepos)
 		if err != nil {
 			return nil, err
 		}
@@ -346,7 +315,7 @@ func renderKustomizations(cmd *cobra.Command, kustomizations []*kustomizev1.Kust
 }
 
 // renderSingleKustomization renders a single Kustomization resource
-func renderSingleKustomization(cmd *cobra.Command, ks *kustomizev1.Kustomization, gitRepositories map[string]*sourcev1.GitRepository, clonedRepos map[string]string) ([]byte, error) {
+func renderSingleKustomization(cmd *cobra.Command, ks *kustomizev1.Kustomization, sources map[string]*unstructured.Unstructured, clonedRepos map[string]string) ([]byte, error) {
 	name := ks.Name
 
 	// Determine the path
@@ -354,24 +323,25 @@ func renderSingleKustomization(cmd *cobra.Command, ks *kustomizev1.Kustomization
 	if path == "" {
 		// If no path provided, need to resolve it based on the source
 		if ks.Spec.SourceRef.Kind == sourcev1.GitRepositoryKind {
-			// Look up the GitRepository
-			sourceKey := fmt.Sprintf("%s/%s", ks.Spec.SourceRef.Namespace, ks.Spec.SourceRef.Name)
-			if ks.Spec.SourceRef.Namespace == "" {
-				namespace := ks.Namespace
+			// Look up the GitRepository from generic sources
+			namespace := ks.Spec.SourceRef.Namespace
+			if namespace == "" {
+				namespace = ks.Namespace
 				if namespace == "" {
 					namespace = "flux-system"
 				}
-				sourceKey = fmt.Sprintf("%s/%s", namespace, ks.Spec.SourceRef.Name)
 			}
 
-			gitRepo, found := gitRepositories[sourceKey]
+			sourceKey := fmt.Sprintf("%s/%s/%s", sourcev1.GitRepositoryKind, namespace, ks.Spec.SourceRef.Name)
+			source, found := sources[sourceKey]
 			if !found {
-				gitRepo, found = gitRepositories[ks.Spec.SourceRef.Name]
+				sourceKey = fmt.Sprintf("%s/%s", sourcev1.GitRepositoryKind, ks.Spec.SourceRef.Name)
+				source, found = sources[sourceKey]
 			}
 
 			if found {
 				// Clone the git repository if not already cloned
-				repoPath, err := cloneGitRepository(gitRepo, clonedRepos)
+				repoPath, err := cloneGitRepositoryFromUnstructured(source, clonedRepos)
 				if err != nil {
 					return nil, fmt.Errorf("failed to clone GitRepository %s: %w", ks.Spec.SourceRef.Name, err)
 				}
@@ -404,29 +374,17 @@ func renderSingleKustomization(cmd *cobra.Command, ks *kustomizev1.Kustomization
 		return nil, fmt.Errorf("invalid resource path %q for Kustomization %s", path, name)
 	}
 
-	var builder *build.Builder
-	if templateArgs.dryRun {
-		builder, err = build.NewBuilder(name, path,
-			build.WithTimeout(rootArgs.timeout),
-			build.WithKustomizationFile(templateArgs.file),
-			build.WithDryRun(templateArgs.dryRun),
-			build.WithNamespace(*kubeconfigArgs.Namespace),
-			build.WithIgnore(templateArgs.ignorePaths),
-			build.WithStrictSubstitute(templateArgs.strictSubst),
-			build.WithRecursive(templateArgs.recursive),
-			build.WithLocalSources(templateArgs.localSources),
-		)
-	} else {
-		builder, err = build.NewBuilder(name, path,
-			build.WithClientConfig(kubeconfigArgs, kubeclientOptions),
-			build.WithTimeout(rootArgs.timeout),
-			build.WithKustomizationFile(templateArgs.file),
-			build.WithIgnore(templateArgs.ignorePaths),
-			build.WithStrictSubstitute(templateArgs.strictSubst),
-			build.WithRecursive(templateArgs.recursive),
-			build.WithLocalSources(templateArgs.localSources),
-		)
-	}
+	// Build in dry-run mode (never connects to cluster)
+	builder, err := build.NewBuilder(name, path,
+		build.WithTimeout(rootArgs.timeout),
+		build.WithKustomizationFile(templateArgs.file),
+		build.WithDryRun(true),
+		build.WithNamespace(*kubeconfigArgs.Namespace),
+		build.WithIgnore(templateArgs.ignorePaths),
+		build.WithStrictSubstitute(templateArgs.strictSubst),
+		build.WithRecursive(templateArgs.recursive),
+		build.WithLocalSources(templateArgs.localSources),
+	)
 
 	if err != nil {
 		return nil, err
@@ -468,35 +426,50 @@ func renderSingleKustomization(cmd *cobra.Command, ks *kustomizev1.Kustomization
 	return output.Bytes(), nil
 }
 
-// cloneGitRepository clones a GitRepository to a temporary directory
-func cloneGitRepository(gitRepo *sourcev1.GitRepository, clonedRepos map[string]string) (string, error) {
+// cloneGitRepositoryFromUnstructured clones a GitRepository (from unstructured) to a temporary directory
+func cloneGitRepositoryFromUnstructured(u *unstructured.Unstructured, clonedRepos map[string]string) (string, error) {
+	namespace := u.GetNamespace()
+	name := u.GetName()
+
 	// Check if already cloned
-	repoKey := fmt.Sprintf("%s/%s", gitRepo.Namespace, gitRepo.Name)
+	repoKey := fmt.Sprintf("%s/%s", namespace, name)
 	if dir, exists := clonedRepos[repoKey]; exists {
 		return dir, nil
 	}
 
+	// Extract spec.url
+	spec, found, err := unstructured.NestedMap(u.Object, "spec")
+	if err != nil || !found {
+		return "", fmt.Errorf("failed to get spec from GitRepository")
+	}
+
+	repoURL, found, err := unstructured.NestedString(spec, "url")
+	if err != nil || !found {
+		return "", fmt.Errorf("failed to get spec.url from GitRepository")
+	}
+
 	// Create temp directory
-	tmpDir, err := os.MkdirTemp("", fmt.Sprintf("flux-template-%s-", gitRepo.Name))
+	tmpDir, err := os.MkdirTemp("", fmt.Sprintf("flux-template-%s-", name))
 	if err != nil {
 		return "", fmt.Errorf("failed to create temp directory: %w", err)
 	}
 
 	// Determine the reference to checkout
 	cloneOpts := &git.CloneOptions{
-		URL:      gitRepo.Spec.URL,
+		URL:      repoURL,
 		Progress: nil,
 	}
 
-	// Set the reference based on gitRepo.Spec.Reference
-	if gitRepo.Spec.Reference != nil {
-		if gitRepo.Spec.Reference.Branch != "" {
-			cloneOpts.ReferenceName = plumbing.NewBranchReferenceName(gitRepo.Spec.Reference.Branch)
-		} else if gitRepo.Spec.Reference.Tag != "" {
-			cloneOpts.ReferenceName = plumbing.NewTagReferenceName(gitRepo.Spec.Reference.Tag)
-		} else if gitRepo.Spec.Reference.Commit != "" {
-			// For specific commit, we need to clone first then checkout
-			cloneOpts.ReferenceName = ""
+	// Extract reference settings
+	ref, refFound, _ := unstructured.NestedMap(spec, "ref")
+	var commitRef string
+	if refFound {
+		if branch, ok, _ := unstructured.NestedString(ref, "branch"); ok && branch != "" {
+			cloneOpts.ReferenceName = plumbing.NewBranchReferenceName(branch)
+		} else if tag, ok, _ := unstructured.NestedString(ref, "tag"); ok && tag != "" {
+			cloneOpts.ReferenceName = plumbing.NewTagReferenceName(tag)
+		} else if commit, ok, _ := unstructured.NestedString(ref, "commit"); ok && commit != "" {
+			commitRef = commit
 		}
 	}
 
@@ -504,11 +477,11 @@ func cloneGitRepository(gitRepo *sourcev1.GitRepository, clonedRepos map[string]
 	repo, err := git.PlainClone(tmpDir, false, cloneOpts)
 	if err != nil {
 		os.RemoveAll(tmpDir)
-		return "", fmt.Errorf("failed to clone repository %s: %w", gitRepo.Spec.URL, err)
+		return "", fmt.Errorf("failed to clone repository %s: %w", repoURL, err)
 	}
 
 	// If a specific commit was requested, checkout that commit
-	if gitRepo.Spec.Reference != nil && gitRepo.Spec.Reference.Commit != "" {
+	if commitRef != "" {
 		worktree, err := repo.Worktree()
 		if err != nil {
 			os.RemoveAll(tmpDir)
@@ -516,11 +489,11 @@ func cloneGitRepository(gitRepo *sourcev1.GitRepository, clonedRepos map[string]
 		}
 
 		err = worktree.Checkout(&git.CheckoutOptions{
-			Hash: plumbing.NewHash(gitRepo.Spec.Reference.Commit),
+			Hash: plumbing.NewHash(commitRef),
 		})
 		if err != nil {
 			os.RemoveAll(tmpDir)
-			return "", fmt.Errorf("failed to checkout commit %s: %w", gitRepo.Spec.Reference.Commit, err)
+			return "", fmt.Errorf("failed to checkout commit %s: %w", commitRef, err)
 		}
 	}
 

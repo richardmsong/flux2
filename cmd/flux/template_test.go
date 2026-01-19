@@ -127,21 +127,17 @@ spec:
 		t.Errorf("expected Kustomization name 'jfrog-token-exchanger', got '%s'", resources.kustomizations[0].Name)
 	}
 
-	// Verify HelmRepository
-	if len(resources.helmRepositories) == 0 {
-		t.Errorf("expected at least 1 HelmRepository, got 0")
+	// Verify sources (HelmRepository and GitRepository are now stored in sources map)
+	if len(resources.sources) == 0 {
+		t.Errorf("expected at least 2 source resources, got 0")
 	} else {
-		if _, found := resources.helmRepositories["jetstack"]; !found {
-			t.Errorf("expected HelmRepository 'jetstack' to be found")
+		// Check for HelmRepository with Kind/name format
+		if _, found := resources.sources["HelmRepository/jetstack"]; !found {
+			t.Errorf("expected HelmRepository 'jetstack' to be found in sources")
 		}
-	}
-
-	// Verify GitRepository
-	if len(resources.gitRepositories) == 0 {
-		t.Errorf("expected at least 1 GitRepository, got 0")
-	} else {
-		if _, found := resources.gitRepositories["jfrog-token-exchanger"]; !found {
-			t.Errorf("expected GitRepository 'jfrog-token-exchanger' to be found")
+		// Check for GitRepository with Kind/name format
+		if _, found := resources.sources["GitRepository/jfrog-token-exchanger"]; !found {
+			t.Errorf("expected GitRepository 'jfrog-token-exchanger' to be found in sources")
 		}
 	}
 }

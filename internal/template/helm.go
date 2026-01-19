@@ -25,10 +25,9 @@ import (
 	"helm.sh/helm/v3/pkg/chart"
 	"helm.sh/helm/v3/pkg/chartutil"
 	"helm.sh/helm/v3/pkg/engine"
-	"sigs.k8s.io/controller-runtime/pkg/client"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 
 	helmv2 "github.com/fluxcd/helm-controller/api/v2"
-	sourcev1 "github.com/fluxcd/source-controller/api/v1"
 )
 
 // HelmRenderer renders HelmRelease resources into Kubernetes manifests
@@ -38,10 +37,10 @@ type HelmRenderer struct {
 }
 
 // NewHelmRenderer creates a new HelmRenderer
-func NewHelmRenderer(kubeClient client.Client, dryRun bool) *HelmRenderer {
+func NewHelmRenderer() *HelmRenderer {
 	return &HelmRenderer{
 		chartFetcher: NewChartFetcher(),
-		valuesMerger: NewValuesMerger(kubeClient, dryRun),
+		valuesMerger: NewValuesMerger(),
 	}
 }
 
@@ -49,26 +48,29 @@ func NewHelmRenderer(kubeClient client.Client, dryRun bool) *HelmRenderer {
 func (r *HelmRenderer) Render(ctx context.Context, opts *HelmTemplateOptions) ([]byte, error) {
 	// Determine chart source
 	var chartName, chartVersion string
-	var repository *sourcev1.HelmRepository
+	var repositorySource *unstructured.Unstructured
 
 	if opts.HelmRelease.Spec.Chart != nil {
 		chartName = opts.HelmRelease.Spec.Chart.Spec.Chart
 		chartVersion = opts.HelmRelease.Spec.Chart.Spec.Version
 
-		// Find the referenced repository
+		// Find the referenced repository from generic sources
 		sourceRef := opts.HelmRelease.Spec.Chart.Spec.SourceRef
-		repoKey := fmt.Sprintf("%s/%s", sourceRef.Namespace, sourceRef.Name)
-		if sourceRef.Namespace == "" {
-			repoKey = fmt.Sprintf("%s/%s", opts.HelmRelease.Namespace, sourceRef.Name)
+		namespace := sourceRef.Namespace
+		if namespace == "" {
+			namespace = opts.HelmRelease.Namespace
 		}
 
-		var ok bool
-		repository, ok = opts.HelmRepositories[repoKey]
-		if !ok && opts.ChartPath == "" {
-			// Try without namespace
-			repository, ok = opts.HelmRepositories[sourceRef.Name]
-			if !ok {
-				return nil, fmt.Errorf("HelmRepository %q not found in provided sources", repoKey)
+		// Look up using Kind/namespace/name format
+		repoKey := fmt.Sprintf("%s/%s/%s", sourceRef.Kind, namespace, sourceRef.Name)
+		var found bool
+		repositorySource, found = opts.Sources[repoKey]
+		if !found && opts.ChartPath == "" {
+			// Try Kind/name format
+			repoKey = fmt.Sprintf("%s/%s", sourceRef.Kind, sourceRef.Name)
+			repositorySource, found = opts.Sources[repoKey]
+			if !found {
+				return nil, fmt.Errorf("%s %q not found in provided sources", sourceRef.Kind, sourceRef.Name)
 			}
 		}
 	}
@@ -77,10 +79,8 @@ func (r *HelmRenderer) Render(ctx context.Context, opts *HelmTemplateOptions) ([
 	fetchOpts := &FetchOptions{
 		ChartName:    chartName,
 		ChartVersion: chartVersion,
-		Repository:   repository,
+		Source:       repositorySource,
 		LocalPath:    opts.ChartPath,
-		KubeClient:   opts.KubeClient,
-		Namespace:    opts.Namespace,
 	}
 
 	chrt, err := r.chartFetcher.Fetch(ctx, fetchOpts)
@@ -205,16 +205,14 @@ func (r *HelmRenderer) renderChart(chrt *chart.Chart, releaseName, namespace str
 }
 
 // RenderMultipleHelmReleases renders multiple HelmReleases and combines the output
-func RenderMultipleHelmReleases(ctx context.Context, kubeClient client.Client, dryRun bool, releases []*helmv2.HelmRelease, repositories map[string]*sourcev1.HelmRepository) ([]byte, error) {
-	renderer := NewHelmRenderer(kubeClient, dryRun)
+func RenderMultipleHelmReleases(ctx context.Context, releases []*helmv2.HelmRelease, sources map[string]*unstructured.Unstructured) ([]byte, error) {
+	renderer := NewHelmRenderer()
 
 	var buf bytes.Buffer
 	for _, hr := range releases {
 		opts := &HelmTemplateOptions{
-			HelmRelease:      hr,
-			HelmRepositories: repositories,
-			KubeClient:       kubeClient,
-			DryRun:           dryRun,
+			HelmRelease: hr,
+			Sources:     sources,
 		}
 
 		rendered, err := renderer.Render(ctx, opts)

@@ -37,8 +37,7 @@ import (
 	"helm.sh/helm/v3/pkg/chart"
 	"helm.sh/helm/v3/pkg/chart/loader"
 	"helm.sh/helm/v3/pkg/repo"
-	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"sigs.k8s.io/yaml"
 
 	sourcev1 "github.com/fluxcd/source-controller/api/v1"
@@ -59,12 +58,20 @@ func (f *DefaultChartFetcher) Fetch(ctx context.Context, opts *FetchOptions) (*c
 		return f.fetchFromLocal(opts.LocalPath)
 	}
 
-	if opts.Repository == nil {
-		return nil, fmt.Errorf("repository is required when local path is not provided")
+	if opts.Source == nil {
+		return nil, fmt.Errorf("source is required when local path is not provided")
 	}
 
+	// Extract spec.type and spec.url from the unstructured source
+	spec, found, _ := unstructured.NestedMap(opts.Source.Object, "spec")
+	if !found {
+		return nil, fmt.Errorf("failed to get spec from source")
+	}
+
+	repoType, _, _ := unstructured.NestedString(spec, "type")
+
 	// Determine if this is an OCI repository
-	if opts.Repository.Spec.Type == sourcev1.HelmRepositoryTypeOCI {
+	if repoType == sourcev1.HelmRepositoryTypeOCI {
 		return f.fetchFromOCI(ctx, opts)
 	}
 
@@ -84,9 +91,14 @@ func (f *DefaultChartFetcher) fetchFromLocal(path string) (*chart.Chart, error) 
 
 // fetchFromHTTP fetches a chart from an HTTP(S) Helm repository
 func (f *DefaultChartFetcher) fetchFromHTTP(ctx context.Context, opts *FetchOptions) (*chart.Chart, error) {
-	repoURL := opts.Repository.Spec.URL
+	// Extract spec.url from unstructured source
+	spec, _, _ := unstructured.NestedMap(opts.Source.Object, "spec")
+	repoURL, _, _ := unstructured.NestedString(spec, "url")
+	if repoURL == "" {
+		return nil, fmt.Errorf("failed to get spec.url from source")
+	}
 
-	// Fetch credentials if secretRef is provided
+	// Get credentials if provided
 	creds, err := f.getCredentials(ctx, opts)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get credentials: %w", err)
@@ -198,7 +210,13 @@ func (f *DefaultChartFetcher) fetchFromHTTP(ctx context.Context, opts *FetchOpti
 
 // fetchFromOCI fetches a chart from an OCI registry
 func (f *DefaultChartFetcher) fetchFromOCI(ctx context.Context, opts *FetchOptions) (*chart.Chart, error) {
-	repoURL := strings.TrimPrefix(opts.Repository.Spec.URL, "oci://")
+	// Extract spec.url from unstructured source
+	spec, _, _ := unstructured.NestedMap(opts.Source.Object, "spec")
+	repoURLRaw, _, _ := unstructured.NestedString(spec, "url")
+	if repoURLRaw == "" {
+		return nil, fmt.Errorf("failed to get spec.url from source")
+	}
+	repoURL := strings.TrimPrefix(repoURLRaw, "oci://")
 
 	// Get credentials
 	creds, err := f.getCredentials(ctx, opts)
@@ -282,43 +300,12 @@ func (f *DefaultChartFetcher) fetchFromOCI(ctx context.Context, opts *FetchOptio
 	return nil, fmt.Errorf("no chart layer found in OCI artifact")
 }
 
-// getCredentials fetches credentials from a Kubernetes Secret
+// getCredentials returns credentials for chart fetching
+// Note: This never connects to the cluster. Credentials must be provided directly via RegistryCredentials.
 func (f *DefaultChartFetcher) getCredentials(ctx context.Context, opts *FetchOptions) (*RegistryCredentials, error) {
-	if opts.RegistryCredentials != nil {
-		return opts.RegistryCredentials, nil
-	}
-
-	if opts.Repository == nil || opts.Repository.Spec.SecretRef == nil {
-		return nil, nil
-	}
-
-	if opts.KubeClient == nil {
-		return nil, nil
-	}
-
-	secretName := opts.Repository.Spec.SecretRef.Name
-	namespace := opts.Namespace
-	if namespace == "" {
-		namespace = opts.Repository.Namespace
-	}
-
-	secret := &corev1.Secret{}
-	if err := opts.KubeClient.Get(ctx, types.NamespacedName{
-		Name:      secretName,
-		Namespace: namespace,
-	}, secret); err != nil {
-		return nil, fmt.Errorf("failed to get secret %s/%s: %w", namespace, secretName, err)
-	}
-
-	creds := &RegistryCredentials{}
-	if username, ok := secret.Data["username"]; ok {
-		creds.Username = string(username)
-	}
-	if password, ok := secret.Data["password"]; ok {
-		creds.Password = string(password)
-	}
-
-	return creds, nil
+	// Only return credentials if they were provided directly
+	// We never fetch credentials from the cluster
+	return opts.RegistryCredentials, nil
 }
 
 // createHTTPClient creates an HTTP client with TLS configuration

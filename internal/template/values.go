@@ -24,29 +24,22 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/go-logr/logr"
-	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/yaml"
 
 	helmv2 "github.com/fluxcd/helm-controller/api/v2"
-	"github.com/fluxcd/pkg/chartutil"
 )
 
 // ValuesMerger handles merging of Helm values from various sources
-type ValuesMerger struct {
-	kubeClient client.Client
-	dryRun     bool
-}
+type ValuesMerger struct{}
 
 // NewValuesMerger creates a new ValuesMerger
-func NewValuesMerger(kubeClient client.Client, dryRun bool) *ValuesMerger {
-	return &ValuesMerger{
-		kubeClient: kubeClient,
-		dryRun:     dryRun,
-	}
+func NewValuesMerger() *ValuesMerger {
+	return &ValuesMerger{}
 }
 
-// MergeValues merges values from HelmRelease spec, valuesFrom references, values files, and set values
+// MergeValues merges values from HelmRelease spec, values files, and set values
+// Note: valuesFrom references (ConfigMaps/Secrets) are not supported as this never connects to the cluster.
+// Use --values flag to provide values files instead.
 func (m *ValuesMerger) MergeValues(ctx context.Context, hr *helmv2.HelmRelease, valuesFiles []string, setValues map[string]string) (map[string]interface{}, error) {
 	result := make(map[string]interface{})
 
@@ -59,21 +52,10 @@ func (m *ValuesMerger) MergeValues(ctx context.Context, hr *helmv2.HelmRelease, 
 		result = mergeMaps(result, inlineValues)
 	}
 
-	// 2. Get values from valuesFrom references (ConfigMaps/Secrets)
-	if !m.dryRun && m.kubeClient != nil && len(hr.Spec.ValuesFrom) > 0 {
-		refValues, err := chartutil.ChartValuesFromReferences(ctx,
-			logr.Discard(),
-			m.kubeClient,
-			hr.GetNamespace(),
-			hr.GetValues(),
-			hr.Spec.ValuesFrom...)
-		if err != nil {
-			return nil, fmt.Errorf("failed to get values from references: %w", err)
-		}
-		result = mergeMaps(result, refValues)
-	}
+	// Note: valuesFrom references (ConfigMaps/Secrets) are skipped as we never connect to the cluster.
+	// Users should provide these values via --values flag instead.
 
-	// 3. Merge additional values files
+	// 2. Merge additional values files
 	for _, file := range valuesFiles {
 		fileValues, err := loadValuesFile(file)
 		if err != nil {
@@ -82,7 +64,7 @@ func (m *ValuesMerger) MergeValues(ctx context.Context, hr *helmv2.HelmRelease, 
 		result = mergeMaps(result, fileValues)
 	}
 
-	// 4. Apply --set values
+	// 3. Apply --set values
 	for key, value := range setValues {
 		if err := setNestedValue(result, key, value); err != nil {
 			return nil, fmt.Errorf("failed to set value %s=%s: %w", key, value, err)
