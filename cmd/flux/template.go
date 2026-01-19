@@ -41,21 +41,7 @@ import (
 )
 
 type templateFlags struct {
-	file        string
-	sourceFiles []string
-	valuesFiles []string
-	setValues   map[string]string
-	chartPath   string
-	kubeVersion string
-	apiVersions []string
-	namespace   string
-	releaseName string
-	// Kustomization-specific flags
-	path         string
-	ignorePaths  []string
-	strictSubst  bool
-	recursive    bool
-	localSources map[string]string
+	file string
 }
 
 var templateArgs templateFlags
@@ -71,47 +57,24 @@ This command interprets Flux resources through source-controller, helm-controlle
 kustomize-controller logic to render out the final manifests to stdout.
 
 The command never connects to the cluster. All resources (HelmRepository, GitRepository,
-ConfigMaps, Secrets for values) must be provided via manifest files.
+ConfigMaps, Secrets for valuesFrom) must be provided in the manifest file.
 
-When using -f/--file, the command automatically detects the resource type from the
-manifest and renders it appropriately. If the file contains multiple HelmRelease or
-Kustomization resources, all of them will be rendered.
+The command automatically detects the resource type from the manifest and renders it
+appropriately. If the file contains multiple HelmRelease or Kustomization resources,
+all of them will be rendered.
 
 For Kustomization resources that reference a GitRepository source, the git repository
 will be cloned to a temporary directory and used as the source path.`,
 	Example: `  # Template a resource (auto-detects type from manifest)
   flux template -f ./manifest.yaml
 
-  # Template multiple resources from a single file
-  flux template -f ./multi-doc.yaml
-
-  # Template a HelmRelease with additional values
-  flux template -f ./helmrelease.yaml \
-    --source-file ./helmrepository.yaml \
-    --values ./production-values.yaml \
-    --set image.tag=v1.0.0
-
-  # Template a Kustomization with path
-  flux template -f ./kustomization.yaml --path ./manifests`,
+  # Template multiple resources from a single multi-document YAML file
+  flux template -f ./multi-doc.yaml`,
 	RunE: templateCmdRun,
 }
 
 func init() {
 	templateCmd.Flags().StringVarP(&templateArgs.file, "file", "f", "", "path to the Flux resource manifest file (auto-detects HelmRelease or Kustomization)")
-	templateCmd.Flags().StringSliceVar(&templateArgs.sourceFiles, "source-file", nil, "path to files containing source resources (e.g., HelmRepository)")
-	templateCmd.Flags().StringSliceVar(&templateArgs.valuesFiles, "values", nil, "path to additional values files (HelmRelease only)")
-	templateCmd.Flags().StringToStringVar(&templateArgs.setValues, "set", nil, "set individual values (key=value, HelmRelease only)")
-	templateCmd.Flags().StringVar(&templateArgs.chartPath, "chart-path", "", "path to local chart directory (HelmRelease only)")
-	templateCmd.Flags().StringVar(&templateArgs.kubeVersion, "kube-version", "", "Kubernetes version for template rendering")
-	templateCmd.Flags().StringSliceVar(&templateArgs.apiVersions, "api-versions", nil, "available API versions for Capabilities (HelmRelease only)")
-	templateCmd.Flags().StringVar(&templateArgs.namespace, "template-namespace", "", "namespace to use for rendering (overrides resource spec)")
-	templateCmd.Flags().StringVar(&templateArgs.releaseName, "release-name", "", "release name to use for rendering (HelmRelease only)")
-	// Kustomization-specific flags
-	templateCmd.Flags().StringVar(&templateArgs.path, "path", "", "path to the manifests location (Kustomization only)")
-	templateCmd.Flags().StringSliceVar(&templateArgs.ignorePaths, "ignore-paths", nil, "set paths to ignore in .gitignore format (Kustomization only)")
-	templateCmd.Flags().BoolVar(&templateArgs.strictSubst, "strict-substitute", false, "fail if a var without a default is missing from input vars (Kustomization only)")
-	templateCmd.Flags().BoolVarP(&templateArgs.recursive, "recursive", "r", false, "recursively template Kustomizations")
-	templateCmd.Flags().StringToStringVar(&templateArgs.localSources, "local-sources", nil, "local sources mapping: Kind/namespace/name=path (Kustomization only)")
 
 	rootCmd.AddCommand(templateCmd)
 }
@@ -292,13 +255,6 @@ func renderHelmReleases(cmd *cobra.Command, helmReleases []*helmv2.HelmRelease, 
 		opts := &template.HelmTemplateOptions{
 			HelmRelease: hr,
 			Sources:     sources,
-			ValuesFiles: templateArgs.valuesFiles,
-			SetValues:   templateArgs.setValues,
-			ChartPath:   templateArgs.chartPath,
-			KubeVersion: templateArgs.kubeVersion,
-			APIVersions: templateArgs.apiVersions,
-			Namespace:   templateArgs.namespace,
-			ReleaseName: templateArgs.releaseName,
 		}
 
 		rendered, err := renderer.Render(ctx, opts)
@@ -339,48 +295,45 @@ func renderKustomizations(cmd *cobra.Command, kustomizations []*kustomizev1.Kust
 func renderSingleKustomization(cmd *cobra.Command, ks *kustomizev1.Kustomization, sources map[string]*unstructured.Unstructured, clonedRepos map[string]string) ([]byte, error) {
 	name := ks.Name
 
-	// Determine the path
-	path := templateArgs.path
-	if path == "" {
-		// If no path provided, need to resolve it based on the source
-		if ks.Spec.SourceRef.Kind == sourcev1.GitRepositoryKind {
-			// Look up the GitRepository from generic sources
-			namespace := ks.Spec.SourceRef.Namespace
+	// Determine the path based on the source
+	var path string
+	if ks.Spec.SourceRef.Kind == sourcev1.GitRepositoryKind {
+		// Look up the GitRepository from generic sources
+		namespace := ks.Spec.SourceRef.Namespace
+		if namespace == "" {
+			namespace = ks.Namespace
 			if namespace == "" {
-				namespace = ks.Namespace
-				if namespace == "" {
-					namespace = "flux-system"
-				}
+				namespace = "flux-system"
 			}
-
-			sourceKey := fmt.Sprintf("%s/%s/%s", sourcev1.GitRepositoryKind, namespace, ks.Spec.SourceRef.Name)
-			source, found := sources[sourceKey]
-			if !found {
-				sourceKey = fmt.Sprintf("%s/%s", sourcev1.GitRepositoryKind, ks.Spec.SourceRef.Name)
-				source, found = sources[sourceKey]
-			}
-
-			if found {
-				// Clone the git repository if not already cloned
-				repoPath, err := cloneGitRepositoryFromUnstructured(source, clonedRepos)
-				if err != nil {
-					return nil, fmt.Errorf("failed to clone GitRepository %s: %w", ks.Spec.SourceRef.Name, err)
-				}
-
-				// Use the spec.path relative to the cloned repo
-				if ks.Spec.Path != "" {
-					path = filepath.Join(repoPath, ks.Spec.Path)
-				} else {
-					path = repoPath
-				}
-			} else {
-				return nil, fmt.Errorf("GitRepository %s not found in manifest; use --local-sources to provide a local path mapping", ks.Spec.SourceRef.Name)
-			}
-		} else if ks.Spec.Path != "" {
-			path = ks.Spec.Path
-		} else {
-			path = filepath.Dir(templateArgs.file)
 		}
+
+		sourceKey := fmt.Sprintf("%s/%s/%s", sourcev1.GitRepositoryKind, namespace, ks.Spec.SourceRef.Name)
+		source, found := sources[sourceKey]
+		if !found {
+			sourceKey = fmt.Sprintf("%s/%s", sourcev1.GitRepositoryKind, ks.Spec.SourceRef.Name)
+			source, found = sources[sourceKey]
+		}
+
+		if found {
+			// Clone the git repository if not already cloned
+			repoPath, err := cloneGitRepositoryFromUnstructured(source, clonedRepos)
+			if err != nil {
+				return nil, fmt.Errorf("failed to clone GitRepository %s: %w", ks.Spec.SourceRef.Name, err)
+			}
+
+			// Use the spec.path relative to the cloned repo
+			if ks.Spec.Path != "" {
+				path = filepath.Join(repoPath, ks.Spec.Path)
+			} else {
+				path = repoPath
+			}
+		} else {
+			return nil, fmt.Errorf("GitRepository %s not found in manifest; include the GitRepository resource in the manifest file", ks.Spec.SourceRef.Name)
+		}
+	} else if ks.Spec.Path != "" {
+		path = ks.Spec.Path
+	} else {
+		path = filepath.Dir(templateArgs.file)
 	}
 
 	// Normalize the path
@@ -401,10 +354,6 @@ func renderSingleKustomization(cmd *cobra.Command, ks *kustomizev1.Kustomization
 		build.WithKustomizationFile(templateArgs.file),
 		build.WithDryRun(true),
 		build.WithNamespace(*kubeconfigArgs.Namespace),
-		build.WithIgnore(templateArgs.ignorePaths),
-		build.WithStrictSubstitute(templateArgs.strictSubst),
-		build.WithRecursive(templateArgs.recursive),
-		build.WithLocalSources(templateArgs.localSources),
 	)
 
 	if err != nil {

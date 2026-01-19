@@ -26,7 +26,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"path/filepath"
 	"sort"
 	"strings"
 
@@ -53,13 +52,8 @@ func NewChartFetcher() *DefaultChartFetcher {
 
 // Fetch fetches a chart from the given source
 func (f *DefaultChartFetcher) Fetch(ctx context.Context, opts *FetchOptions) (*chart.Chart, error) {
-	// If local path is provided, load from there
-	if opts.LocalPath != "" {
-		return f.fetchFromLocal(opts.LocalPath)
-	}
-
 	if opts.Source == nil {
-		return nil, fmt.Errorf("source is required when local path is not provided")
+		return nil, fmt.Errorf("source is required")
 	}
 
 	// Extract spec.type and spec.url from the unstructured source
@@ -77,16 +71,6 @@ func (f *DefaultChartFetcher) Fetch(ctx context.Context, opts *FetchOptions) (*c
 
 	// Otherwise, fetch from HTTP(S) repository
 	return f.fetchFromHTTP(ctx, opts)
-}
-
-// fetchFromLocal loads a chart from a local directory or archive
-func (f *DefaultChartFetcher) fetchFromLocal(path string) (*chart.Chart, error) {
-	absPath, err := filepath.Abs(path)
-	if err != nil {
-		return nil, fmt.Errorf("failed to resolve absolute path: %w", err)
-	}
-
-	return loader.Load(absPath)
 }
 
 // fetchFromHTTP fetches a chart from an HTTP(S) Helm repository

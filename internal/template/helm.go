@@ -65,7 +65,7 @@ func (r *HelmRenderer) Render(ctx context.Context, opts *HelmTemplateOptions) ([
 		repoKey := fmt.Sprintf("%s/%s/%s", sourceRef.Kind, namespace, sourceRef.Name)
 		var found bool
 		repositorySource, found = opts.Sources[repoKey]
-		if !found && opts.ChartPath == "" {
+		if !found {
 			// Try Kind/name format
 			repoKey = fmt.Sprintf("%s/%s", sourceRef.Kind, sourceRef.Name)
 			repositorySource, found = opts.Sources[repoKey]
@@ -80,7 +80,6 @@ func (r *HelmRenderer) Render(ctx context.Context, opts *HelmTemplateOptions) ([
 		ChartName:    chartName,
 		ChartVersion: chartVersion,
 		Source:       repositorySource,
-		LocalPath:    opts.ChartPath,
 	}
 
 	chrt, err := r.chartFetcher.Fetch(ctx, fetchOpts)
@@ -89,24 +88,18 @@ func (r *HelmRenderer) Render(ctx context.Context, opts *HelmTemplateOptions) ([
 	}
 
 	// Merge values (pass Sources which may contain ConfigMaps/Secrets for valuesFrom)
-	values, err := r.valuesMerger.MergeValues(ctx, opts.HelmRelease, opts.Sources, opts.ValuesFiles, opts.SetValues)
+	values, err := r.valuesMerger.MergeValues(ctx, opts.HelmRelease, opts.Sources)
 	if err != nil {
 		return nil, fmt.Errorf("failed to merge values: %w", err)
 	}
 
-	// Determine release name and namespace
-	releaseName := opts.ReleaseName
-	if releaseName == "" {
-		releaseName = opts.HelmRelease.Spec.ReleaseName
-	}
+	// Determine release name and namespace from the HelmRelease spec
+	releaseName := opts.HelmRelease.Spec.ReleaseName
 	if releaseName == "" {
 		releaseName = opts.HelmRelease.Name
 	}
 
-	namespace := opts.Namespace
-	if namespace == "" {
-		namespace = opts.HelmRelease.Spec.TargetNamespace
-	}
+	namespace := opts.HelmRelease.Spec.TargetNamespace
 	if namespace == "" {
 		namespace = opts.HelmRelease.Namespace
 	}
@@ -115,7 +108,7 @@ func (r *HelmRenderer) Render(ctx context.Context, opts *HelmTemplateOptions) ([
 	}
 
 	// Render the chart
-	rendered, err := r.renderChart(chrt, releaseName, namespace, values, opts)
+	rendered, err := r.renderChart(chrt, releaseName, namespace, values)
 	if err != nil {
 		return nil, fmt.Errorf("failed to render chart: %w", err)
 	}
@@ -137,7 +130,7 @@ func (r *HelmRenderer) Render(ctx context.Context, opts *HelmTemplateOptions) ([
 }
 
 // renderChart renders a Helm chart with the given values
-func (r *HelmRenderer) renderChart(chrt *chart.Chart, releaseName, namespace string, values map[string]interface{}, opts *HelmTemplateOptions) ([]byte, error) {
+func (r *HelmRenderer) renderChart(chrt *chart.Chart, releaseName, namespace string, values map[string]interface{}) ([]byte, error) {
 	// Create release options
 	releaseOpts := chartutil.ReleaseOptions{
 		Name:      releaseName,
@@ -147,19 +140,8 @@ func (r *HelmRenderer) renderChart(chrt *chart.Chart, releaseName, namespace str
 		IsUpgrade: false,
 	}
 
-	// Create capabilities
+	// Create capabilities with defaults
 	caps := chartutil.DefaultCapabilities.Copy()
-	if opts.KubeVersion != "" {
-		kubeVersion, err := chartutil.ParseKubeVersion(opts.KubeVersion)
-		if err != nil {
-			return nil, fmt.Errorf("failed to parse kube version %q: %w", opts.KubeVersion, err)
-		}
-		caps.KubeVersion = *kubeVersion
-	}
-
-	if len(opts.APIVersions) > 0 {
-		caps.APIVersions = append(caps.APIVersions, opts.APIVersions...)
-	}
 
 	// Coalesce values
 	valuesToRender, err := chartutil.ToRenderValues(chrt, values, releaseOpts, caps)

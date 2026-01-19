@@ -82,96 +82,6 @@ func TestMergeMaps(t *testing.T) {
 	}
 }
 
-func TestSetNestedValue(t *testing.T) {
-	tests := []struct {
-		name     string
-		initial  map[string]interface{}
-		key      string
-		value    string
-		expected map[string]interface{}
-		wantErr  bool
-	}{
-		{
-			name:     "simple key",
-			initial:  map[string]interface{}{},
-			key:      "key",
-			value:    "value",
-			expected: map[string]interface{}{"key": "value"},
-		},
-		{
-			name:     "nested key",
-			initial:  map[string]interface{}{},
-			key:      "outer.inner",
-			value:    "value",
-			expected: map[string]interface{}{"outer": map[string]interface{}{"inner": "value"}},
-		},
-		{
-			name:     "deeply nested key",
-			initial:  map[string]interface{}{},
-			key:      "a.b.c",
-			value:    "value",
-			expected: map[string]interface{}{"a": map[string]interface{}{"b": map[string]interface{}{"c": "value"}}},
-		},
-		{
-			name:     "boolean true",
-			initial:  map[string]interface{}{},
-			key:      "enabled",
-			value:    "true",
-			expected: map[string]interface{}{"enabled": true},
-		},
-		{
-			name:     "boolean false",
-			initial:  map[string]interface{}{},
-			key:      "enabled",
-			value:    "false",
-			expected: map[string]interface{}{"enabled": false},
-		},
-		{
-			name:     "integer value",
-			initial:  map[string]interface{}{},
-			key:      "count",
-			value:    "42",
-			expected: map[string]interface{}{"count": int64(42)},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			err := setNestedValue(tt.initial, tt.key, tt.value)
-			if (err != nil) != tt.wantErr {
-				t.Errorf("setNestedValue() error = %v, wantErr %v", err, tt.wantErr)
-				return
-			}
-			if !mapsEqual(tt.initial, tt.expected) {
-				t.Errorf("setNestedValue() result = %v, expected %v", tt.initial, tt.expected)
-			}
-		})
-	}
-}
-
-func TestParseValue(t *testing.T) {
-	tests := []struct {
-		input    string
-		expected interface{}
-	}{
-		{"true", true},
-		{"false", false},
-		{"42", int64(42)},
-		{"3.14", 3.14},
-		{"hello", "hello"},
-		{"", ""},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.input, func(t *testing.T) {
-			result := parseValue(tt.input)
-			if result != tt.expected {
-				t.Errorf("parseValue(%q) = %v (%T), expected %v (%T)", tt.input, result, result, tt.expected, tt.expected)
-			}
-		})
-	}
-}
-
 // Helper function to compare maps
 func mapsEqual(a, b map[string]interface{}) bool {
 	if len(a) != len(b) {
@@ -194,3 +104,4 @@ func mapsEqual(a, b map[string]interface{}) bool {
 	}
 	return true
 }
+

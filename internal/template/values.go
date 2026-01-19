@@ -21,8 +21,6 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"os"
-	"strconv"
 	"strings"
 
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -39,10 +37,10 @@ func NewValuesMerger() *ValuesMerger {
 	return &ValuesMerger{}
 }
 
-// MergeValues merges values from HelmRelease spec, valuesFrom references, values files, and set values.
+// MergeValues merges values from HelmRelease spec and valuesFrom references.
 // Resources map should contain any ConfigMaps or Secrets referenced in valuesFrom, keyed by "Kind/namespace/name".
-// If a valuesFrom reference is not found in resources, an error is returned.
-func (m *ValuesMerger) MergeValues(ctx context.Context, hr *helmv2.HelmRelease, resources map[string]*unstructured.Unstructured, valuesFiles []string, setValues map[string]string) (map[string]interface{}, error) {
+// If a valuesFrom reference is not found in resources and is not optional, an error is returned.
+func (m *ValuesMerger) MergeValues(ctx context.Context, hr *helmv2.HelmRelease, resources map[string]*unstructured.Unstructured) (map[string]interface{}, error) {
 	result := make(map[string]interface{})
 
 	// 1. Get values from HelmRelease spec (inline values)
@@ -67,22 +65,6 @@ func (m *ValuesMerger) MergeValues(ctx context.Context, hr *helmv2.HelmRelease, 
 				return nil, err
 			}
 			result = mergeMaps(result, valuesFromData)
-		}
-	}
-
-	// 3. Merge additional values files
-	for _, file := range valuesFiles {
-		fileValues, err := loadValuesFile(file)
-		if err != nil {
-			return nil, fmt.Errorf("failed to load values file %s: %w", file, err)
-		}
-		result = mergeMaps(result, fileValues)
-	}
-
-	// 4. Apply --set values
-	for key, value := range setValues {
-		if err := setNestedValue(result, key, value); err != nil {
-			return nil, fmt.Errorf("failed to set value %s=%s: %w", key, value, err)
 		}
 	}
 
@@ -203,71 +185,6 @@ func setNestedMap(m map[string]interface{}, path string, value map[string]interf
 	}
 
 	return nil
-}
-
-// loadValuesFile loads values from a YAML file
-func loadValuesFile(path string) (map[string]interface{}, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
-
-	var values map[string]interface{}
-	if err := yaml.Unmarshal(data, &values); err != nil {
-		return nil, err
-	}
-
-	return values, nil
-}
-
-// setNestedValue sets a value in a nested map using dot notation
-// e.g., "image.tag" = "v1.0.0" sets result["image"]["tag"] = "v1.0.0"
-func setNestedValue(m map[string]interface{}, key, value string) error {
-	keys := strings.Split(key, ".")
-	current := m
-
-	for i, k := range keys {
-		if i == len(keys)-1 {
-			// Last key - set the value
-			current[k] = parseValue(value)
-		} else {
-			// Not the last key - navigate or create nested map
-			if _, ok := current[k]; !ok {
-				current[k] = make(map[string]interface{})
-			}
-			if nested, ok := current[k].(map[string]interface{}); ok {
-				current = nested
-			} else {
-				return fmt.Errorf("key %s is not a map", strings.Join(keys[:i+1], "."))
-			}
-		}
-	}
-
-	return nil
-}
-
-// parseValue attempts to parse a string value into its appropriate type
-func parseValue(s string) interface{} {
-	// Try to parse as bool
-	if s == "true" {
-		return true
-	}
-	if s == "false" {
-		return false
-	}
-
-	// Try to parse as int
-	if i, err := strconv.ParseInt(s, 10, 64); err == nil {
-		return i
-	}
-
-	// Try to parse as float
-	if f, err := strconv.ParseFloat(s, 64); err == nil {
-		return f
-	}
-
-	// Return as string
-	return s
 }
 
 // mergeMaps recursively merges src into dst

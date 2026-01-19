@@ -32,27 +32,6 @@ type HelmTemplateOptions struct {
 
 	// Sources are source resources (HelmRepository, GitRepository, etc.) keyed by "Kind/namespace/name" or "Kind/name"
 	Sources map[string]*unstructured.Unstructured
-
-	// ValuesFiles are additional values files to merge
-	ValuesFiles []string
-
-	// SetValues are individual value overrides (key=value format)
-	SetValues map[string]string
-
-	// ChartPath is the path to a local chart directory (overrides fetching)
-	ChartPath string
-
-	// KubeVersion is the Kubernetes version to use for rendering
-	KubeVersion string
-
-	// APIVersions are the available API versions for Capabilities
-	APIVersions []string
-
-	// Namespace is the target namespace for rendering
-	Namespace string
-
-	// ReleaseName is the name to use for the Helm release
-	ReleaseName string
 }
 
 // ChartFetcher fetches Helm charts from various sources
@@ -71,9 +50,6 @@ type FetchOptions struct {
 
 	// Source is the source resource (HelmRepository, etc.) as an unstructured object
 	Source *unstructured.Unstructured
-
-	// LocalPath is the path to a local chart (if set, overrides remote fetching)
-	LocalPath string
 
 	// RegistryCredentials contains credentials for OCI registries (provided directly, not fetched from cluster)
 	RegistryCredentials *RegistryCredentials
