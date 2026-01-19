@@ -27,8 +27,10 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
+	"github.com/Masterminds/semver/v3"
 	"github.com/google/go-containerregistry/pkg/authn"
 	"github.com/google/go-containerregistry/pkg/crane"
 	"github.com/google/go-containerregistry/pkg/name"
@@ -198,18 +200,6 @@ func (f *DefaultChartFetcher) fetchFromHTTP(ctx context.Context, opts *FetchOpti
 func (f *DefaultChartFetcher) fetchFromOCI(ctx context.Context, opts *FetchOptions) (*chart.Chart, error) {
 	repoURL := strings.TrimPrefix(opts.Repository.Spec.URL, "oci://")
 
-	// Build the full image reference
-	ref := fmt.Sprintf("%s/%s", repoURL, opts.ChartName)
-	if opts.ChartVersion != "" {
-		ref = fmt.Sprintf("%s:%s", ref, opts.ChartVersion)
-	}
-
-	// Parse the reference
-	imgRef, err := name.ParseReference(ref)
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse OCI reference %q: %w", ref, err)
-	}
-
 	// Get credentials
 	creds, err := f.getCredentials(ctx, opts)
 	if err != nil {
@@ -230,6 +220,28 @@ func (f *DefaultChartFetcher) fetchFromOCI(ctx context.Context, opts *FetchOptio
 
 	if creds != nil && creds.Insecure {
 		craneOpts = append(craneOpts, crane.Insecure)
+	}
+
+	// Resolve version constraint if needed
+	chartVersion := opts.ChartVersion
+	if chartVersion != "" && isVersionConstraint(chartVersion) {
+		resolved, err := f.resolveOCIVersionConstraint(ctx, repoURL, opts.ChartName, chartVersion, craneOpts)
+		if err != nil {
+			return nil, fmt.Errorf("failed to resolve version constraint %q: %w", chartVersion, err)
+		}
+		chartVersion = resolved
+	}
+
+	// Build the full image reference
+	ref := fmt.Sprintf("%s/%s", repoURL, opts.ChartName)
+	if chartVersion != "" {
+		ref = fmt.Sprintf("%s:%s", ref, chartVersion)
+	}
+
+	// Parse the reference
+	imgRef, err := name.ParseReference(ref)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse OCI reference %q: %w", ref, err)
 	}
 
 	// Pull the chart as a blob
@@ -346,4 +358,66 @@ func (f *DefaultChartFetcher) createHTTPClient(creds *RegistryCredentials) (*htt
 			TLSClientConfig: tlsConfig,
 		},
 	}, nil
+}
+
+// isVersionConstraint checks if the version string is a semver constraint rather than an exact version.
+// Semver constraints include wildcards (*, x, X), ranges (>=, <=, >, <, ~, ^), or multiple conditions (||, &&, -, spaces).
+func isVersionConstraint(version string) bool {
+	// Check for constraint operators and wildcards
+	constraintIndicators := []string{"*", "x", "X", ">=", "<=", ">", "<", "~", "^", "||", " ", "-"}
+	for _, indicator := range constraintIndicators {
+		if strings.Contains(version, indicator) {
+			return true
+		}
+	}
+	return false
+}
+
+// resolveOCIVersionConstraint resolves a semver version constraint to a specific version
+// by listing all available tags from the OCI registry and finding the best match.
+func (f *DefaultChartFetcher) resolveOCIVersionConstraint(ctx context.Context, repoURL, chartName, versionConstraint string, craneOpts []crane.Option) (string, error) {
+	// Parse the version constraint
+	constraint, err := semver.NewConstraint(versionConstraint)
+	if err != nil {
+		return "", fmt.Errorf("invalid version constraint %q: %w", versionConstraint, err)
+	}
+
+	// Build the repository reference for listing tags
+	repoRef := fmt.Sprintf("%s/%s", repoURL, chartName)
+
+	// List all available tags from the OCI registry
+	tags, err := crane.ListTags(repoRef, craneOpts...)
+	if err != nil {
+		return "", fmt.Errorf("failed to list tags for %q: %w", repoRef, err)
+	}
+
+	if len(tags) == 0 {
+		return "", fmt.Errorf("no tags found for %q", repoRef)
+	}
+
+	// Parse tags as semver versions and find matches
+	var matchingVersions []*semver.Version
+	for _, tag := range tags {
+		// Try to parse the tag as a semver version
+		v, err := semver.NewVersion(tag)
+		if err != nil {
+			// Skip tags that aren't valid semver (e.g., "latest", "sha-xxx")
+			continue
+		}
+
+		// Check if version matches the constraint
+		if constraint.Check(v) {
+			matchingVersions = append(matchingVersions, v)
+		}
+	}
+
+	if len(matchingVersions) == 0 {
+		return "", fmt.Errorf("no version matching constraint %q found in available tags: %v", versionConstraint, tags)
+	}
+
+	// Sort versions in descending order (highest first)
+	sort.Sort(sort.Reverse(semver.Collection(matchingVersions)))
+
+	// Return the highest matching version
+	return matchingVersions[0].Original(), nil
 }
