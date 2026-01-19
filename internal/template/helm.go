@@ -169,7 +169,7 @@ func (r *HelmRenderer) renderChart(chrt *chart.Chart, releaseName, namespace str
 
 	// Render templates
 	eng := engine.Engine{
-		Strict:   true,
+		Strict:   false,
 		LintMode: false,
 	}
 
