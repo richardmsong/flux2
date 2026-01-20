@@ -26,10 +26,17 @@ import (
 	"path/filepath"
 	"strings"
 
+	"cloud.google.com/go/storage"
+	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	awsconfig "github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/google/go-containerregistry/pkg/crane"
 	"github.com/spf13/cobra"
+	"google.golang.org/api/iterator"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	k8syaml "k8s.io/apimachinery/pkg/util/yaml"
 
@@ -361,7 +368,10 @@ func renderSingleKustomization(cmd *cobra.Command, ks *kustomizev1.Kustomization
 			}
 
 		case sourcev1.BucketKind:
-			return nil, fmt.Errorf("Bucket source type is not supported for local templating; Bucket sources require cloud provider credentials which are typically managed by the cluster")
+			sourcePath, err = downloadBucketFromUnstructured(source, clonedRepos)
+			if err != nil {
+				return nil, fmt.Errorf("failed to download Bucket %s: %w", ks.Spec.SourceRef.Name, err)
+			}
 		}
 
 		// Use the spec.path relative to the fetched source
@@ -508,6 +518,329 @@ func cloneGitRepositoryFromUnstructured(u *unstructured.Unstructured, clonedRepo
 
 	clonedRepos[repoKey] = tmpDir
 	return tmpDir, nil
+}
+
+// downloadBucketFromUnstructured downloads files from a Bucket source to a temporary directory
+// It supports AWS S3, GCP Cloud Storage, and Azure Blob Storage using local credentials
+func downloadBucketFromUnstructured(u *unstructured.Unstructured, clonedRepos map[string]string) (string, error) {
+	namespace := u.GetNamespace()
+	name := u.GetName()
+
+	// Check if already downloaded
+	repoKey := fmt.Sprintf("bucket/%s/%s", namespace, name)
+	if dir, exists := clonedRepos[repoKey]; exists {
+		return dir, nil
+	}
+
+	// Extract spec
+	spec, found, err := unstructured.NestedMap(u.Object, "spec")
+	if err != nil || !found {
+		return "", fmt.Errorf("failed to get spec from Bucket")
+	}
+
+	// Get required fields
+	bucketName, found, err := unstructured.NestedString(spec, "bucketName")
+	if err != nil || !found || bucketName == "" {
+		return "", fmt.Errorf("failed to get spec.bucketName from Bucket")
+	}
+
+	endpoint, found, err := unstructured.NestedString(spec, "endpoint")
+	if err != nil || !found || endpoint == "" {
+		return "", fmt.Errorf("failed to get spec.endpoint from Bucket")
+	}
+
+	// Get optional fields
+	provider, _, _ := unstructured.NestedString(spec, "provider")
+	if provider == "" {
+		provider = sourcev1.BucketProviderGeneric
+	}
+
+	region, _, _ := unstructured.NestedString(spec, "region")
+	prefix, _, _ := unstructured.NestedString(spec, "prefix")
+	insecure, _, _ := unstructured.NestedBool(spec, "insecure")
+
+	// Create temp directory
+	tmpDir, err := os.MkdirTemp("", fmt.Sprintf("flux-template-bucket-%s-", name))
+	if err != nil {
+		return "", fmt.Errorf("failed to create temp directory: %w", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), rootArgs.timeout)
+	defer cancel()
+
+	// Download based on provider
+	switch provider {
+	case sourcev1.BucketProviderAmazon:
+		err = downloadFromS3(ctx, bucketName, endpoint, region, prefix, insecure, tmpDir)
+	case sourcev1.BucketProviderGoogle:
+		err = downloadFromGCS(ctx, bucketName, prefix, tmpDir)
+	case sourcev1.BucketProviderAzure:
+		err = downloadFromAzureBlob(ctx, bucketName, endpoint, prefix, tmpDir)
+	case sourcev1.BucketProviderGeneric:
+		// Generic provider uses S3-compatible API
+		err = downloadFromS3(ctx, bucketName, endpoint, region, prefix, insecure, tmpDir)
+	default:
+		os.RemoveAll(tmpDir)
+		return "", fmt.Errorf("unsupported bucket provider: %s", provider)
+	}
+
+	if err != nil {
+		os.RemoveAll(tmpDir)
+		return "", fmt.Errorf("failed to download from bucket: %w", err)
+	}
+
+	clonedRepos[repoKey] = tmpDir
+	return tmpDir, nil
+}
+
+// downloadFromS3 downloads files from an S3 or S3-compatible bucket using local credentials
+func downloadFromS3(ctx context.Context, bucketName, endpoint, region, prefix string, insecure bool, destDir string) error {
+	// AWS SDK v2 automatically loads credentials from:
+	// - Environment variables (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY)
+	// - Shared credentials file (~/.aws/credentials)
+	// - IAM roles (when running on AWS infrastructure)
+	cfg, err := awsconfig.LoadDefaultConfig(ctx,
+		awsconfig.WithRegion(region),
+	)
+	if err != nil {
+		return fmt.Errorf("failed to load AWS config: %w", err)
+	}
+
+	// Configure custom endpoint for S3-compatible storage
+	customResolver := aws.EndpointResolverWithOptionsFunc(func(service, resolvedRegion string, options ...interface{}) (aws.Endpoint, error) {
+		if service == s3.ServiceID {
+			scheme := "https"
+			if insecure {
+				scheme = "http"
+			}
+			return aws.Endpoint{
+				URL:               fmt.Sprintf("%s://%s", scheme, endpoint),
+				HostnameImmutable: true,
+			}, nil
+		}
+		return aws.Endpoint{}, &aws.EndpointNotFoundError{}
+	})
+
+	cfg.EndpointResolverWithOptions = customResolver
+
+	client := s3.NewFromConfig(cfg, func(o *s3.Options) {
+		o.UsePathStyle = true
+	})
+
+	// List objects in the bucket
+	paginator := s3.NewListObjectsV2Paginator(client, &s3.ListObjectsV2Input{
+		Bucket: aws.String(bucketName),
+		Prefix: aws.String(prefix),
+	})
+
+	for paginator.HasMorePages() {
+		output, err := paginator.NextPage(ctx)
+		if err != nil {
+			return fmt.Errorf("failed to list objects: %w", err)
+		}
+
+		for _, obj := range output.Contents {
+			if obj.Key == nil {
+				continue
+			}
+			key := *obj.Key
+
+			// Skip directories
+			if strings.HasSuffix(key, "/") {
+				continue
+			}
+
+			// Get the object
+			result, err := client.GetObject(ctx, &s3.GetObjectInput{
+				Bucket: aws.String(bucketName),
+				Key:    obj.Key,
+			})
+			if err != nil {
+				return fmt.Errorf("failed to get object %s: %w", key, err)
+			}
+
+			// Determine destination path (remove prefix if present)
+			relPath := key
+			if prefix != "" {
+				relPath = strings.TrimPrefix(key, prefix)
+				relPath = strings.TrimPrefix(relPath, "/")
+			}
+			destPath := filepath.Join(destDir, relPath)
+
+			// Create parent directories
+			if err := os.MkdirAll(filepath.Dir(destPath), 0755); err != nil {
+				result.Body.Close()
+				return fmt.Errorf("failed to create directory for %s: %w", destPath, err)
+			}
+
+			// Write file
+			f, err := os.Create(destPath)
+			if err != nil {
+				result.Body.Close()
+				return fmt.Errorf("failed to create file %s: %w", destPath, err)
+			}
+
+			_, err = io.Copy(f, result.Body)
+			result.Body.Close()
+			f.Close()
+			if err != nil {
+				return fmt.Errorf("failed to write file %s: %w", destPath, err)
+			}
+		}
+	}
+
+	return nil
+}
+
+// downloadFromGCS downloads files from a GCS bucket using local credentials
+func downloadFromGCS(ctx context.Context, bucketName, prefix string, destDir string) error {
+	// GCS client automatically loads credentials from:
+	// - GOOGLE_APPLICATION_CREDENTIALS environment variable
+	// - Default application credentials (gcloud auth application-default login)
+	// - Metadata server (when running on GCP infrastructure)
+	client, err := storage.NewClient(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to create GCS client: %w", err)
+	}
+	defer client.Close()
+
+	bucket := client.Bucket(bucketName)
+	query := &storage.Query{Prefix: prefix}
+
+	it := bucket.Objects(ctx, query)
+	for {
+		attrs, err := it.Next()
+		if err == iterator.Done {
+			break
+		}
+		if err != nil {
+			return fmt.Errorf("failed to list objects: %w", err)
+		}
+
+		// Skip directories
+		if strings.HasSuffix(attrs.Name, "/") {
+			continue
+		}
+
+		// Get the object
+		rc, err := bucket.Object(attrs.Name).NewReader(ctx)
+		if err != nil {
+			return fmt.Errorf("failed to read object %s: %w", attrs.Name, err)
+		}
+
+		// Determine destination path (remove prefix if present)
+		relPath := attrs.Name
+		if prefix != "" {
+			relPath = strings.TrimPrefix(attrs.Name, prefix)
+			relPath = strings.TrimPrefix(relPath, "/")
+		}
+		destPath := filepath.Join(destDir, relPath)
+
+		// Create parent directories
+		if err := os.MkdirAll(filepath.Dir(destPath), 0755); err != nil {
+			rc.Close()
+			return fmt.Errorf("failed to create directory for %s: %w", destPath, err)
+		}
+
+		// Write file
+		f, err := os.Create(destPath)
+		if err != nil {
+			rc.Close()
+			return fmt.Errorf("failed to create file %s: %w", destPath, err)
+		}
+
+		_, err = io.Copy(f, rc)
+		rc.Close()
+		f.Close()
+		if err != nil {
+			return fmt.Errorf("failed to write file %s: %w", destPath, err)
+		}
+	}
+
+	return nil
+}
+
+// downloadFromAzureBlob downloads files from Azure Blob Storage using local credentials
+func downloadFromAzureBlob(ctx context.Context, containerName, endpoint, prefix string, destDir string) error {
+	// Azure SDK automatically loads credentials from:
+	// - Environment variables (AZURE_TENANT_ID, AZURE_CLIENT_ID, AZURE_CLIENT_SECRET)
+	// - Azure CLI credentials (az login)
+	// - Managed Identity (when running on Azure infrastructure)
+	cred, err := azidentity.NewDefaultAzureCredential(nil)
+	if err != nil {
+		return fmt.Errorf("failed to create Azure credential: %w", err)
+	}
+
+	// Build service URL from endpoint
+	serviceURL := endpoint
+	if !strings.HasPrefix(serviceURL, "https://") && !strings.HasPrefix(serviceURL, "http://") {
+		serviceURL = "https://" + endpoint
+	}
+
+	client, err := azblob.NewClient(serviceURL, cred, nil)
+	if err != nil {
+		return fmt.Errorf("failed to create Azure Blob client: %w", err)
+	}
+
+	// List blobs in the container
+	pager := client.NewListBlobsFlatPager(containerName, &azblob.ListBlobsFlatOptions{
+		Prefix: &prefix,
+	})
+
+	for pager.More() {
+		resp, err := pager.NextPage(ctx)
+		if err != nil {
+			return fmt.Errorf("failed to list blobs: %w", err)
+		}
+
+		for _, blob := range resp.Segment.BlobItems {
+			if blob.Name == nil {
+				continue
+			}
+			blobName := *blob.Name
+
+			// Skip directories (blobs ending with /)
+			if strings.HasSuffix(blobName, "/") {
+				continue
+			}
+
+			// Download the blob
+			downloadResp, err := client.DownloadStream(ctx, containerName, blobName, nil)
+			if err != nil {
+				return fmt.Errorf("failed to download blob %s: %w", blobName, err)
+			}
+
+			// Determine destination path (remove prefix if present)
+			relPath := blobName
+			if prefix != "" {
+				relPath = strings.TrimPrefix(blobName, prefix)
+				relPath = strings.TrimPrefix(relPath, "/")
+			}
+			destPath := filepath.Join(destDir, relPath)
+
+			// Create parent directories
+			if err := os.MkdirAll(filepath.Dir(destPath), 0755); err != nil {
+				downloadResp.Body.Close()
+				return fmt.Errorf("failed to create directory for %s: %w", destPath, err)
+			}
+
+			// Write file
+			f, err := os.Create(destPath)
+			if err != nil {
+				downloadResp.Body.Close()
+				return fmt.Errorf("failed to create file %s: %w", destPath, err)
+			}
+
+			_, err = io.Copy(f, downloadResp.Body)
+			downloadResp.Body.Close()
+			f.Close()
+			if err != nil {
+				return fmt.Errorf("failed to write file %s: %w", destPath, err)
+			}
+		}
+	}
+
+	return nil
 }
 
 // pullOCIRepositoryFromUnstructured pulls an OCIRepository artifact to a temporary directory
