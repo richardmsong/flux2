@@ -372,13 +372,7 @@ func renderSingleKustomization(cmd *cobra.Command, ks *kustomizev1.Kustomization
 		}
 
 	default:
-		// For unknown or no source type, use local path
-		if ks.Spec.Path != "" {
-			path = ks.Spec.Path
-		} else {
-			// Use manifest file's directory, or current working directory when reading from stdin
-			path = filepath.Dir(manifestFile)
-		}
+		return nil, fmt.Errorf("unsupported source type %q for Kustomization %s; supported source types are GitRepository, OCIRepository, and Bucket", sourceKind, name)
 	}
 
 	// Normalize the path
