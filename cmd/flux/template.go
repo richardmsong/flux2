@@ -51,7 +51,8 @@ import (
 )
 
 type templateFlags struct {
-	file string
+	file      string
+	recursive bool
 }
 
 var templateArgs templateFlags
@@ -74,7 +75,12 @@ appropriately. If the file contains multiple HelmRelease or Kustomization resour
 all of them will be rendered.
 
 For Kustomization resources that reference a GitRepository source, the git repository
-will be cloned to a temporary directory and used as the source path.`,
+will be cloned to a temporary directory and used as the source path.
+
+When --recursive is enabled, the command will continue to render any Flux resources
+(HelmRelease, Kustomization) found in the rendered output until no more Flux resources
+remain. This is useful for nested deployments where a Kustomization might produce
+HelmReleases or other Kustomizations.`,
 	Example: `  # Template a resource (auto-detects type from manifest)
   flux template -f ./manifest.yaml
 
@@ -83,12 +89,16 @@ will be cloned to a temporary directory and used as the source path.`,
 
   # Template from stdin (pipe from other commands)
   kustomize build ./overlay | flux template -f -
-  cat manifest.yaml | flux template -f -`,
+  cat manifest.yaml | flux template -f -
+
+  # Recursively render nested Flux resources
+  flux template -f ./manifest.yaml --recursive`,
 	RunE: templateCmdRun,
 }
 
 func init() {
 	templateCmd.Flags().StringVarP(&templateArgs.file, "file", "f", "", "path to the Flux resource manifest file (auto-detects HelmRelease or Kustomization); use '-' to read from stdin")
+	templateCmd.Flags().BoolVarP(&templateArgs.recursive, "recursive", "r", false, "recursively render Flux resources found in the output")
 
 	rootCmd.AddCommand(templateCmd)
 }
@@ -265,8 +275,237 @@ func templateCmdRun(cmd *cobra.Command, args []string) error {
 		output.Write(rendered)
 	}
 
+	// If recursive mode is enabled, continue rendering any Flux resources found in the output
+	if templateArgs.recursive {
+		rendered, err := renderRecursively(cmd, output.Bytes(), resources.sources, filePath)
+		if err != nil {
+			return err
+		}
+		output.Reset()
+		output.Write(rendered)
+	}
+
 	cmd.Print(output.String())
 	return nil
+}
+
+// renderRecursively continues to render Flux resources found in the output until none remain
+func renderRecursively(cmd *cobra.Command, input []byte, sources map[string]*unstructured.Unstructured, manifestFile string) ([]byte, error) {
+	// Track rendered resources to avoid infinite loops
+	renderedHRs := make(map[string]bool)
+	renderedKSs := make(map[string]bool)
+
+	// Track cloned git repos for cleanup
+	clonedRepos := make(map[string]string)
+	defer func() {
+		for _, dir := range clonedRepos {
+			os.RemoveAll(dir)
+		}
+	}()
+
+	currentOutput := input
+
+	for {
+		// Parse the current output to find any Flux resources
+		nestedResources, err := parseResourcesFromBytes(currentOutput)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse rendered output for nested resources: %w", err)
+		}
+
+		// Merge any sources found in the output with our existing sources
+		for k, v := range nestedResources.sources {
+			if _, exists := sources[k]; !exists {
+				sources[k] = v
+			}
+		}
+
+		// Filter to only new (unrendered) resources
+		var newHRs []*helmv2.HelmRelease
+		for _, hr := range nestedResources.helmReleases {
+			key := fmt.Sprintf("%s/%s", hr.Namespace, hr.Name)
+			if hr.Namespace == "" {
+				key = fmt.Sprintf("default/%s", hr.Name)
+			}
+			if !renderedHRs[key] {
+				newHRs = append(newHRs, hr)
+				renderedHRs[key] = true
+			}
+		}
+
+		var newKSs []*kustomizev1.Kustomization
+		for _, ks := range nestedResources.kustomizations {
+			key := fmt.Sprintf("%s/%s", ks.Namespace, ks.Name)
+			if ks.Namespace == "" {
+				key = fmt.Sprintf("default/%s", ks.Name)
+			}
+			if !renderedKSs[key] {
+				newKSs = append(newKSs, ks)
+				renderedKSs[key] = true
+			}
+		}
+
+		// If no new resources, we're done
+		if len(newHRs) == 0 && len(newKSs) == 0 {
+			break
+		}
+
+		// Render the new resources
+		var newOutput bytes.Buffer
+
+		// First, add all non-Flux resources from current output
+		nonFluxManifests := extractNonFluxManifests(currentOutput)
+		newOutput.Write(nonFluxManifests)
+
+		// Render new HelmReleases
+		if len(newHRs) > 0 {
+			rendered, err := renderHelmReleases(cmd, newHRs, sources)
+			if err != nil {
+				return nil, err
+			}
+			newOutput.Write(rendered)
+		}
+
+		// Render new Kustomizations
+		if len(newKSs) > 0 {
+			rendered, err := renderKustomizationsWithRepos(cmd, newKSs, sources, clonedRepos, manifestFile)
+			if err != nil {
+				return nil, err
+			}
+			newOutput.Write(rendered)
+		}
+
+		currentOutput = newOutput.Bytes()
+	}
+
+	return currentOutput, nil
+}
+
+// parseResourcesFromBytes parses resources from a byte slice (for recursive rendering)
+func parseResourcesFromBytes(data []byte) (*parsedResources, error) {
+	result := &parsedResources{
+		sources: make(map[string]*unstructured.Unstructured),
+	}
+
+	// Split by YAML document separator
+	docs := bytes.Split(data, []byte("\n---"))
+	for _, doc := range docs {
+		doc = bytes.TrimSpace(doc)
+		if len(doc) == 0 {
+			continue
+		}
+
+		// First, determine the kind
+		decoder := k8syaml.NewYAMLOrJSONDecoder(bytes.NewReader(doc), len(doc))
+		var raw map[string]interface{}
+		if err := decoder.Decode(&raw); err != nil {
+			continue
+		}
+
+		kind, _ := raw["kind"].(string)
+		apiVersion, _ := raw["apiVersion"].(string)
+
+		// Re-create decoder for actual parsing
+		decoder = k8syaml.NewYAMLOrJSONDecoder(bytes.NewReader(doc), len(doc))
+
+		switch {
+		case kind == helmv2.HelmReleaseKind && isHelmReleaseAPIVersion(apiVersion):
+			var hr helmv2.HelmRelease
+			if err := decoder.Decode(&hr); err == nil && hr.Kind == helmv2.HelmReleaseKind {
+				result.helmReleases = append(result.helmReleases, &hr)
+			}
+
+		case kind == kustomizev1.KustomizationKind && isKustomizationAPIVersion(apiVersion):
+			var ks kustomizev1.Kustomization
+			if err := decoder.Decode(&ks); err == nil && ks.Kind == kustomizev1.KustomizationKind {
+				result.kustomizations = append(result.kustomizations, &ks)
+			}
+
+		case isSourceAPIVersion(apiVersion):
+			// Store all source resources generically
+			var u unstructured.Unstructured
+			u.SetUnstructuredContent(raw)
+			namespace := u.GetNamespace()
+			if namespace == "" {
+				namespace = "default"
+			}
+			name := u.GetName()
+			result.sources[fmt.Sprintf("%s/%s/%s", kind, namespace, name)] = &u
+			result.sources[fmt.Sprintf("%s/%s", kind, name)] = &u
+
+		case isCoreResource(apiVersion, kind):
+			// Store core resources (ConfigMap, Secret) for valuesFrom references
+			var u unstructured.Unstructured
+			u.SetUnstructuredContent(raw)
+			namespace := u.GetNamespace()
+			if namespace == "" {
+				namespace = "default"
+			}
+			name := u.GetName()
+			result.sources[fmt.Sprintf("%s/%s/%s", kind, namespace, name)] = &u
+			result.sources[fmt.Sprintf("%s/%s", kind, name)] = &u
+		}
+	}
+
+	return result, nil
+}
+
+// extractNonFluxManifests extracts manifests that are not Flux resources (HelmRelease, Kustomization)
+func extractNonFluxManifests(data []byte) []byte {
+	var result bytes.Buffer
+
+	docs := bytes.Split(data, []byte("\n---"))
+	for _, doc := range docs {
+		doc = bytes.TrimSpace(doc)
+		if len(doc) == 0 {
+			continue
+		}
+
+		// Parse to check kind
+		decoder := k8syaml.NewYAMLOrJSONDecoder(bytes.NewReader(doc), len(doc))
+		var raw map[string]interface{}
+		if err := decoder.Decode(&raw); err != nil {
+			// If we can't parse it, include it anyway
+			if result.Len() > 0 {
+				result.WriteString("---\n")
+			}
+			result.Write(doc)
+			result.WriteString("\n")
+			continue
+		}
+
+		kind, _ := raw["kind"].(string)
+		apiVersion, _ := raw["apiVersion"].(string)
+
+		// Skip Flux resources
+		if (kind == helmv2.HelmReleaseKind && isHelmReleaseAPIVersion(apiVersion)) ||
+			(kind == kustomizev1.KustomizationKind && isKustomizationAPIVersion(apiVersion)) {
+			continue
+		}
+
+		// Include non-Flux resources
+		if result.Len() > 0 {
+			result.WriteString("---\n")
+		}
+		result.Write(doc)
+		result.WriteString("\n")
+	}
+
+	return result.Bytes()
+}
+
+// renderKustomizationsWithRepos renders Kustomizations using a shared clonedRepos map
+func renderKustomizationsWithRepos(cmd *cobra.Command, kustomizations []*kustomizev1.Kustomization, sources map[string]*unstructured.Unstructured, clonedRepos map[string]string, manifestFile string) ([]byte, error) {
+	var output bytes.Buffer
+
+	for _, ks := range kustomizations {
+		rendered, err := renderSingleKustomization(cmd, ks, sources, clonedRepos, manifestFile)
+		if err != nil {
+			return nil, err
+		}
+		output.Write(rendered)
+	}
+
+	return output.Bytes(), nil
 }
 
 // renderHelmReleases renders all HelmRelease resources

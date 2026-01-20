@@ -349,3 +349,176 @@ func TestIsSourceAPIVersion(t *testing.T) {
 		})
 	}
 }
+
+func TestParseResourcesFromBytes(t *testing.T) {
+	input := []byte(`---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: my-app
+  namespace: default
+spec:
+  replicas: 1
+---
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: nested-release
+  namespace: flux-system
+spec:
+  interval: 5m
+  chart:
+    spec:
+      chart: my-chart
+      sourceRef:
+        kind: HelmRepository
+        name: my-repo
+---
+apiVersion: source.toolkit.fluxcd.io/v1
+kind: HelmRepository
+metadata:
+  name: discovered-repo
+  namespace: flux-system
+spec:
+  interval: 1h
+  url: https://charts.example.com
+---
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: nested-kustomization
+  namespace: flux-system
+spec:
+  interval: 10m
+  path: ./path
+  sourceRef:
+    kind: GitRepository
+    name: my-git-repo
+`)
+
+	resources, err := parseResourcesFromBytes(input)
+	if err != nil {
+		t.Fatalf("parseResourcesFromBytes failed: %v", err)
+	}
+
+	// Verify HelmRelease was found
+	if len(resources.helmReleases) != 1 {
+		t.Errorf("expected 1 HelmRelease, got %d", len(resources.helmReleases))
+	} else if resources.helmReleases[0].Name != "nested-release" {
+		t.Errorf("expected HelmRelease name 'nested-release', got '%s'", resources.helmReleases[0].Name)
+	}
+
+	// Verify Kustomization was found
+	if len(resources.kustomizations) != 1 {
+		t.Errorf("expected 1 Kustomization, got %d", len(resources.kustomizations))
+	} else if resources.kustomizations[0].Name != "nested-kustomization" {
+		t.Errorf("expected Kustomization name 'nested-kustomization', got '%s'", resources.kustomizations[0].Name)
+	}
+
+	// Verify source was found
+	if _, found := resources.sources["HelmRepository/discovered-repo"]; !found {
+		t.Errorf("expected HelmRepository 'discovered-repo' to be found in sources")
+	}
+}
+
+func TestExtractNonFluxManifests(t *testing.T) {
+	input := []byte(`---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: my-app
+  namespace: default
+spec:
+  replicas: 1
+---
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: skip-this
+  namespace: flux-system
+spec:
+  interval: 5m
+  chart:
+    spec:
+      chart: my-chart
+      sourceRef:
+        kind: HelmRepository
+        name: my-repo
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: my-config
+  namespace: default
+data:
+  key: value
+---
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: skip-this-too
+  namespace: flux-system
+spec:
+  interval: 10m
+  path: ./path
+  sourceRef:
+    kind: GitRepository
+    name: my-git-repo
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: my-service
+  namespace: default
+spec:
+  ports:
+    - port: 80
+`)
+
+	result := extractNonFluxManifests(input)
+
+	// Parse result to verify only non-Flux resources remain
+	resources, err := parseResourcesFromBytes(result)
+	if err != nil {
+		t.Fatalf("parseResourcesFromBytes failed: %v", err)
+	}
+
+	// Should have no Flux resources
+	if len(resources.helmReleases) != 0 {
+		t.Errorf("expected 0 HelmReleases, got %d", len(resources.helmReleases))
+	}
+	if len(resources.kustomizations) != 0 {
+		t.Errorf("expected 0 Kustomizations, got %d", len(resources.kustomizations))
+	}
+
+	// Verify the result contains expected non-Flux resources
+	resultStr := string(result)
+	if !contains(resultStr, "kind: Deployment") {
+		t.Errorf("expected Deployment in result")
+	}
+	if !contains(resultStr, "kind: ConfigMap") {
+		t.Errorf("expected ConfigMap in result")
+	}
+	if !contains(resultStr, "kind: Service") {
+		t.Errorf("expected Service in result")
+	}
+	if contains(resultStr, "kind: HelmRelease") {
+		t.Errorf("HelmRelease should not be in result")
+	}
+	if contains(resultStr, "kind: Kustomization") {
+		t.Errorf("Kustomization should not be in result")
+	}
+}
+
+func contains(s, substr string) bool {
+	return len(s) >= len(substr) && (s == substr || len(s) > 0 && containsHelper(s, substr))
+}
+
+func containsHelper(s, substr string) bool {
+	for i := 0; i <= len(s)-len(substr); i++ {
+		if s[i:i+len(substr)] == substr {
+			return true
+		}
+	}
+	return false
+}
