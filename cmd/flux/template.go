@@ -636,12 +636,18 @@ func renderSingleKustomization(cmd *cobra.Command, ks *kustomizev1.Kustomization
 		return nil, fmt.Errorf("invalid resource path %q for Kustomization %s", path, name)
 	}
 
+	// Determine the namespace for the builder lookup
+	ksNamespace := ks.Namespace
+	if ksNamespace == "" {
+		ksNamespace = *kubeconfigArgs.Namespace
+	}
+
 	// Build in dry-run mode (never connects to cluster)
 	builder, err := build.NewBuilder(name, path,
 		build.WithTimeout(rootArgs.timeout),
 		build.WithKustomizationFile(manifestFile),
 		build.WithDryRun(true),
-		build.WithNamespace(*kubeconfigArgs.Namespace),
+		build.WithNamespace(ksNamespace),
 	)
 
 	if err != nil {
