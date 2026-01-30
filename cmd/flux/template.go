@@ -272,6 +272,10 @@ func templateCmdRun(cmd *cobra.Command, args []string) error {
 		if err != nil {
 			return err
 		}
+		// Add separator between HelmReleases and Kustomizations output if needed
+		if output.Len() > 0 && len(rendered) > 0 && !bytes.HasPrefix(rendered, []byte("---")) {
+			output.WriteString("---\n")
+		}
 		output.Write(rendered)
 	}
 
@@ -529,6 +533,10 @@ func renderHelmReleases(cmd *cobra.Command, helmReleases []*helmv2.HelmRelease, 
 			return nil, fmt.Errorf("failed to render HelmRelease %s: %w", hr.Name, err)
 		}
 
+		// Ensure proper YAML document separation between releases
+		if output.Len() > 0 && len(rendered) > 0 && !bytes.HasPrefix(rendered, []byte("---")) {
+			output.WriteString("---\n")
+		}
 		output.Write(rendered)
 	}
 
@@ -551,6 +559,10 @@ func renderKustomizations(cmd *cobra.Command, kustomizations []*kustomizev1.Kust
 		rendered, err := renderSingleKustomization(cmd, ks, sources, clonedRepos, manifestFile)
 		if err != nil {
 			return nil, err
+		}
+		// Ensure proper YAML document separation
+		if output.Len() > 0 && len(rendered) > 0 && !bytes.HasPrefix(rendered, []byte("---")) {
+			output.WriteString("---\n")
 		}
 		output.Write(rendered)
 	}
