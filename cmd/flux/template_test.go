@@ -140,6 +140,20 @@ spec:
 			t.Errorf("expected GitRepository 'jfrog-token-exchanger' to be found in sources")
 		}
 	}
+
+	// Verify otherResources captures the Namespace (non-Flux resource)
+	if len(resources.otherResources) != 1 {
+		t.Errorf("expected 1 otherResource (Namespace), got %d", len(resources.otherResources))
+	} else {
+		// Verify the captured resource contains the Namespace
+		otherStr := string(resources.otherResources[0])
+		if !contains(otherStr, "kind: Namespace") {
+			t.Errorf("expected otherResources to contain Namespace")
+		}
+		if !contains(otherStr, "name: cert-manager") {
+			t.Errorf("expected otherResources to contain cert-manager namespace")
+		}
+	}
 }
 
 func TestParseAllResourcesMultipleHelmReleases(t *testing.T) {
@@ -507,6 +521,201 @@ spec:
 	}
 	if contains(resultStr, "kind: Kustomization") {
 		t.Errorf("Kustomization should not be in result")
+	}
+}
+
+// TestParseAllResourcesWithNonFluxResources tests that non-Flux resources
+// (like Bundle from trust.cert-manager.io/v1alpha1) are captured in otherResources
+func TestParseAllResourcesWithNonFluxResources(t *testing.T) {
+	tmpDir := t.TempDir()
+	mixedPath := filepath.Join(tmpDir, "mixed.yaml")
+
+	// This simulates the issue from #5 where Bundle resources were being filtered out
+	mixedYAML := `---
+apiVersion: trust.cert-manager.io/v1alpha1
+kind: Bundle
+metadata:
+  name: public-bundle
+  namespace: cert-manager
+spec:
+  sources:
+    - useDefaultCAs: true
+  target:
+    configMap:
+      key: ca-certificates.crt
+    namespaceSelector:
+      matchLabels:
+        public-bundle: "true"
+---
+apiVersion: source.toolkit.fluxcd.io/v1
+kind: HelmRepository
+metadata:
+  name: jetstack
+  namespace: flux-system
+spec:
+  type: oci
+  interval: 1h
+  url: oci://quay.io/jetstack/charts
+---
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: trust-manager
+  namespace: flux-system
+spec:
+  interval: 30m
+  chart:
+    spec:
+      chart: trust-manager
+      sourceRef:
+        kind: HelmRepository
+        name: jetstack
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-all
+  namespace: default
+spec:
+  podSelector: {}
+  ingress:
+    - {}
+`
+
+	if err := os.WriteFile(mixedPath, []byte(mixedYAML), 0644); err != nil {
+		t.Fatalf("failed to write test file: %v", err)
+	}
+
+	resources, err := parseAllResources(mixedPath)
+	if err != nil {
+		t.Fatalf("parseAllResources failed: %v", err)
+	}
+
+	// Verify HelmRelease was parsed
+	if len(resources.helmReleases) != 1 {
+		t.Errorf("expected 1 HelmRelease, got %d", len(resources.helmReleases))
+	}
+
+	// Verify sources were parsed
+	if _, found := resources.sources["HelmRepository/jetstack"]; !found {
+		t.Errorf("expected HelmRepository 'jetstack' to be found in sources")
+	}
+
+	// Verify non-Flux resources were captured in otherResources
+	if len(resources.otherResources) != 2 {
+		t.Errorf("expected 2 otherResources (Bundle and NetworkPolicy), got %d", len(resources.otherResources))
+	}
+
+	// Verify Bundle is in otherResources
+	foundBundle := false
+	foundNetworkPolicy := false
+	for _, res := range resources.otherResources {
+		resStr := string(res)
+		if contains(resStr, "kind: Bundle") && contains(resStr, "trust.cert-manager.io") {
+			foundBundle = true
+		}
+		if contains(resStr, "kind: NetworkPolicy") {
+			foundNetworkPolicy = true
+		}
+	}
+
+	if !foundBundle {
+		t.Errorf("expected Bundle resource to be captured in otherResources")
+	}
+	if !foundNetworkPolicy {
+		t.Errorf("expected NetworkPolicy resource to be captured in otherResources")
+	}
+}
+
+// TestParseAllResourcesOnlyNonFluxResources tests the case where only non-Flux resources are present
+func TestParseAllResourcesOnlyNonFluxResources(t *testing.T) {
+	tmpDir := t.TempDir()
+	nonFluxPath := filepath.Join(tmpDir, "non-flux.yaml")
+
+	nonFluxYAML := `---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: my-namespace
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: my-app
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: my-app
+  template:
+    metadata:
+      labels:
+        app: my-app
+    spec:
+      containers:
+        - name: app
+          image: nginx:latest
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: my-service
+  namespace: default
+spec:
+  selector:
+    app: my-app
+  ports:
+    - port: 80
+`
+
+	if err := os.WriteFile(nonFluxPath, []byte(nonFluxYAML), 0644); err != nil {
+		t.Fatalf("failed to write test file: %v", err)
+	}
+
+	resources, err := parseAllResources(nonFluxPath)
+	if err != nil {
+		t.Fatalf("parseAllResources failed: %v", err)
+	}
+
+	// Verify no Flux resources
+	if len(resources.helmReleases) != 0 {
+		t.Errorf("expected 0 HelmReleases, got %d", len(resources.helmReleases))
+	}
+	if len(resources.kustomizations) != 0 {
+		t.Errorf("expected 0 Kustomizations, got %d", len(resources.kustomizations))
+	}
+
+	// Verify all resources are in otherResources
+	if len(resources.otherResources) != 3 {
+		t.Errorf("expected 3 otherResources, got %d", len(resources.otherResources))
+	}
+
+	// Verify the types of resources
+	foundNamespace := false
+	foundDeployment := false
+	foundService := false
+	for _, res := range resources.otherResources {
+		resStr := string(res)
+		if contains(resStr, "kind: Namespace") {
+			foundNamespace = true
+		}
+		if contains(resStr, "kind: Deployment") {
+			foundDeployment = true
+		}
+		if contains(resStr, "kind: Service") {
+			foundService = true
+		}
+	}
+
+	if !foundNamespace {
+		t.Errorf("expected Namespace in otherResources")
+	}
+	if !foundDeployment {
+		t.Errorf("expected Deployment in otherResources")
+	}
+	if !foundService {
+		t.Errorf("expected Service in otherResources")
 	}
 }
 
