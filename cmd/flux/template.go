@@ -110,6 +110,8 @@ type parsedResources struct {
 	// sources holds all source resources (HelmRepository, GitRepository, OCIRepository, Bucket, etc.)
 	// keyed by "Kind/namespace/name" and "Kind/name" for lookup
 	sources map[string]*unstructured.Unstructured
+	// otherResources holds non-Flux resources that should be passed through unchanged
+	otherResources [][]byte
 }
 
 // parseAllResources parses all supported resources from a file
@@ -182,6 +184,10 @@ func parseAllResources(path string) (*parsedResources, error) {
 			// Store with multiple keys for flexible lookup
 			result.sources[fmt.Sprintf("%s/%s/%s", kind, namespace, name)] = &u
 			result.sources[fmt.Sprintf("%s/%s", kind, name)] = &u
+
+		default:
+			// Store non-Flux resources to pass through unchanged
+			result.otherResources = append(result.otherResources, doc)
 		}
 	}
 
@@ -249,6 +255,19 @@ func templateCmdRun(cmd *cobra.Command, args []string) error {
 
 	// Check if we have any resources to render
 	if len(resources.helmReleases) == 0 && len(resources.kustomizations) == 0 {
+		// If we have other resources but no Flux resources, just pass them through
+		if len(resources.otherResources) > 0 {
+			var output bytes.Buffer
+			for i, res := range resources.otherResources {
+				if i > 0 {
+					output.WriteString("---\n")
+				}
+				output.Write(res)
+				output.WriteString("\n")
+			}
+			cmd.Print(output.String())
+			return nil
+		}
 		if templateArgs.file == "-" {
 			return fmt.Errorf("no supported Flux resource (HelmRelease or Kustomization) found in stdin")
 		}
@@ -257,11 +276,23 @@ func templateCmdRun(cmd *cobra.Command, args []string) error {
 
 	var output bytes.Buffer
 
+	// First, output any non-Flux resources (pass through unchanged)
+	for i, res := range resources.otherResources {
+		if i > 0 || output.Len() > 0 {
+			output.WriteString("---\n")
+		}
+		output.Write(res)
+		output.WriteString("\n")
+	}
+
 	// Render all HelmReleases
 	if len(resources.helmReleases) > 0 {
 		rendered, err := renderHelmReleases(cmd, resources.helmReleases, resources.sources)
 		if err != nil {
 			return err
+		}
+		if output.Len() > 0 && len(rendered) > 0 && !bytes.HasPrefix(rendered, []byte("---")) {
+			output.WriteString("---\n")
 		}
 		output.Write(rendered)
 	}
