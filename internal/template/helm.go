@@ -82,6 +82,15 @@ func (r *HelmRenderer) Render(ctx context.Context, opts *HelmTemplateOptions) ([
 		Source:       repositorySource,
 	}
 
+	// Read spec.insecure from the source if set
+	insecure, _, _ := unstructured.NestedBool(repositorySource.Object, "spec", "insecure")
+	if insecure {
+		if fetchOpts.RegistryCredentials == nil {
+			fetchOpts.RegistryCredentials = &RegistryCredentials{}
+		}
+		fetchOpts.RegistryCredentials.Insecure = true
+	}
+
 	chrt, err := r.chartFetcher.Fetch(ctx, fetchOpts)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch chart: %w", err)

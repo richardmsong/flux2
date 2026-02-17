@@ -160,6 +160,11 @@ func createIndexYAML(chartName string, versions []string, baseURL string) ([]byt
 
 // createHelmRepoSource creates an unstructured HelmRepository source
 func createHelmRepoSource(name, namespace, url string, repoType string) *unstructured.Unstructured {
+	return createHelmRepoSourceWithInsecure(name, namespace, url, repoType, false)
+}
+
+// createHelmRepoSourceWithInsecure creates an unstructured HelmRepository source with optional insecure flag
+func createHelmRepoSourceWithInsecure(name, namespace, url string, repoType string, insecure bool) *unstructured.Unstructured {
 	source := &unstructured.Unstructured{}
 	source.SetAPIVersion("source.toolkit.fluxcd.io/v1")
 	source.SetKind("HelmRepository")
@@ -172,6 +177,9 @@ func createHelmRepoSource(name, namespace, url string, repoType string) *unstruc
 	}
 	if repoType != "" {
 		spec["type"] = repoType
+	}
+	if insecure {
+		spec["insecure"] = true
 	}
 	source.Object["spec"] = spec
 	return source
@@ -481,6 +489,90 @@ func TestChartFetcher_FetchFromHTTP_TLSConfig(t *testing.T) {
 				Source:              source,
 				RegistryCredentials: tt.creds,
 			})
+
+			if tt.expectError {
+				if err == nil {
+					t.Error("expected error, got nil")
+				}
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+
+			if chart.Metadata.Name != chartName {
+				t.Errorf("expected chart name %q, got %q", chartName, chart.Metadata.Name)
+			}
+		})
+	}
+}
+
+// TestChartFetcher_FetchFromHTTP_SourceInsecureFlag tests that spec.insecure from source is respected
+func TestChartFetcher_FetchFromHTTP_SourceInsecureFlag(t *testing.T) {
+	chartName := "test-chart"
+	chartVersion := "1.0.0"
+
+	chartData, err := createTestChart(chartName, chartVersion)
+	if err != nil {
+		t.Fatalf("failed to create test chart: %v", err)
+	}
+
+	// Create TLS server (self-signed cert)
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/index.yaml":
+			indexData, _ := createIndexYAML(chartName, []string{chartVersion}, "")
+			w.Header().Set("Content-Type", "application/x-yaml")
+			w.Write(indexData)
+		case fmt.Sprintf("/%s-%s.tgz", chartName, chartVersion):
+			w.Header().Set("Content-Type", "application/x-tar")
+			w.Write(chartData)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	tests := []struct {
+		name        string
+		insecure    bool
+		expectError bool
+	}{
+		{
+			name:        "source with spec.insecure=true should skip TLS verification",
+			insecure:    true,
+			expectError: false,
+		},
+		{
+			name:        "source without insecure flag should fail TLS verification",
+			insecure:    false,
+			expectError: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fetcher := NewChartFetcher()
+			source := createHelmRepoSourceWithInsecure("test-repo", "flux-system", server.URL, "", tt.insecure)
+
+			// Build FetchOptions and read insecure from source (mimicking helm.go behavior)
+			fetchOpts := &FetchOptions{
+				ChartName:    chartName,
+				ChartVersion: chartVersion,
+				Source:       source,
+			}
+
+			// Read spec.insecure from the source if set (same logic as helm.go)
+			insecure, _, _ := unstructured.NestedBool(source.Object, "spec", "insecure")
+			if insecure {
+				if fetchOpts.RegistryCredentials == nil {
+					fetchOpts.RegistryCredentials = &RegistryCredentials{}
+				}
+				fetchOpts.RegistryCredentials.Insecure = true
+			}
+
+			chart, err := fetcher.Fetch(context.Background(), fetchOpts)
 
 			if tt.expectError {
 				if err == nil {
