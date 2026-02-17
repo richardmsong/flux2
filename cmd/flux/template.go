@@ -110,6 +110,8 @@ type parsedResources struct {
 	// sources holds all source resources (HelmRepository, GitRepository, OCIRepository, Bucket, etc.)
 	// keyed by "Kind/namespace/name" and "Kind/name" for lookup
 	sources map[string]*unstructured.Unstructured
+	// otherResources holds all non-Flux resources that should be passed through unchanged
+	otherResources [][]byte
 }
 
 // parseAllResources parses all supported resources from a file
@@ -182,6 +184,12 @@ func parseAllResources(path string) (*parsedResources, error) {
 			// Store with multiple keys for flexible lookup
 			result.sources[fmt.Sprintf("%s/%s/%s", kind, namespace, name)] = &u
 			result.sources[fmt.Sprintf("%s/%s", kind, name)] = &u
+			// Also add to otherResources so they are passed through in output
+			result.otherResources = append(result.otherResources, doc)
+
+		default:
+			// Store all other resources to be passed through unchanged
+			result.otherResources = append(result.otherResources, doc)
 		}
 	}
 
@@ -247,15 +255,21 @@ func templateCmdRun(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to parse resources: %w", err)
 	}
 
-	// Check if we have any resources to render
-	if len(resources.helmReleases) == 0 && len(resources.kustomizations) == 0 {
-		if templateArgs.file == "-" {
-			return fmt.Errorf("no supported Flux resource (HelmRelease or Kustomization) found in stdin")
-		}
-		return fmt.Errorf("no supported Flux resource (HelmRelease or Kustomization) found in file %s", templateArgs.file)
-	}
-
 	var output bytes.Buffer
+
+	// If no Flux resources found, just passthrough all input unchanged
+	if len(resources.helmReleases) == 0 && len(resources.kustomizations) == 0 {
+		// Write all other resources (non-Flux resources) to output
+		for i, doc := range resources.otherResources {
+			if i > 0 || output.Len() > 0 {
+				output.WriteString("---\n")
+			}
+			output.Write(doc)
+			output.WriteString("\n")
+		}
+		cmd.Print(output.String())
+		return nil
+	}
 
 	// Render all HelmReleases
 	if len(resources.helmReleases) > 0 {
@@ -277,6 +291,15 @@ func templateCmdRun(cmd *cobra.Command, args []string) error {
 			output.WriteString("---\n")
 		}
 		output.Write(rendered)
+	}
+
+	// Add non-Flux resources (other resources) to output - they should be passed through unchanged
+	for _, doc := range resources.otherResources {
+		if output.Len() > 0 {
+			output.WriteString("---\n")
+		}
+		output.Write(doc)
+		output.WriteString("\n")
 	}
 
 	// If recursive mode is enabled, continue rendering any Flux resources found in the output
@@ -447,6 +470,12 @@ func parseResourcesFromBytes(data []byte) (*parsedResources, error) {
 			name := u.GetName()
 			result.sources[fmt.Sprintf("%s/%s/%s", kind, namespace, name)] = &u
 			result.sources[fmt.Sprintf("%s/%s", kind, name)] = &u
+			// Also add to otherResources so they are passed through in output
+			result.otherResources = append(result.otherResources, doc)
+
+		default:
+			// Store all other resources to be passed through unchanged
+			result.otherResources = append(result.otherResources, doc)
 		}
 	}
 
